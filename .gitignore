@@ -1,0 +1,14 @@
+node_modules/
+resources/
+backup/
+.env
+*.env
+*.sqlite
+*.db
+party.db
+rules.db
+dist/
+coverage/
+*.log
+.DS_Store
+Discord Bot.txt

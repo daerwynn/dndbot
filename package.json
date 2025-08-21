@@ -1,0 +1,21 @@
+{
+  "name": "dnd-gm-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1",
+    "glob": "^11.0.3",
+    "openai": "^5.12.2",
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^5.4.54"
+  }
+}
