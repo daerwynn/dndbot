@@ -1466,6 +1466,68 @@ try {
   console.warn('Moves DB open failed:', e.message);
 }
 
+// --- Event Capture: minimal skeleton -----------------------------
+
+// Optional: set this to Avrae's bot user ID if you want stricter filtering.
+// Leave null to just pattern-match content.
+// You can right-click Avrae in Discord > Copy ID (with Developer Mode on).
+const AVRAE_BOT_ID = null;
+
+// crude patterns for first step (we'll harden later)
+const RX_CHECK_CMD = /^!check\b|\b!skill\b|\b!ability\b/i;
+
+// returns a tiny, structured event or null
+function detectEventFromMessage(msg) {
+  // skip our own bot
+  if (msg.author?.bot && msg.client?.user && msg.author.id === msg.client.user.id) return null;
+
+  // if we know Avrae's ID, require it; otherwise allow anyone (for testing)
+  if (AVRAE_BOT_ID && msg.author?.id !== AVRAE_BOT_ID) return null;
+
+  const content = (msg.content || "").trim();
+
+  // Minimal v1: detect "!check ..." style
+  if (RX_CHECK_CMD.test(content)) {
+    // Example: "!check stealth" or "!check perception adv"
+    const args = content.replace(/^!/, "").split(/\s+/); // ["check","stealth","adv"]
+    const [cmd, maybeSkill, ...rest] = args;
+    return {
+      type: "event:roll",
+      subtype: "check",
+      skill: maybeSkill || null,
+      flags: rest.join(" ") || null,
+      authorId: msg.author?.id || null,
+      authorTag: msg.author?.tag || msg.author?.username || null,
+      channelId: msg.channel?.id || null,
+      messageId: msg.id,
+      // we’ll attach session/party linkage later
+      raw: content
+    };
+  }
+
+  return null;
+}
+
+// one lightweight listener
+function attachEventCapture(client) {
+  client.on("messageCreate", (msg) => {
+    const evt = detectEventFromMessage(msg);
+    if (!evt) return;
+
+    // For Step 1: just print a clean debug line.
+    // (Later we’ll upsert to gm_logs and respect session gating.)
+    const pretty = JSON.stringify(evt);
+    console.log(`[event-capture] ${pretty}`);
+
+    // TODO (Step 2): write to gm_logs with a dedupe key (session_id, message_id).
+  });
+}
+
+// Call this after you create/login the Discord client:
+attachEventCapture(client);
+
+// --- /Event Capture skeleton -------------------------------------
+
 
 /* =========================
    OpenAI client + model config
