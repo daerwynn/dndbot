@@ -1685,6 +1685,82 @@ function classifyAvraeInit(msg) {
   return null;
 }
 
+// Acquire active session id; return null if none (adjust to your util)
+function getActiveSessionIdSafe(guildId, channelId) {
+  try {
+    return getActiveSessionId(guildId, channelId); // if you already have this
+  } catch {
+    return null;
+  }
+}
+
+// Map our event to gm_logs fields
+function toGmLogRow(evt) {
+  // Category
+  let category = null;
+  if (evt.type === "combat:init") {
+    category = "combat:init"; // subtype will live in content
+  } else if (String(evt.type || "").startsWith("rest:")) {
+    category = "rest:" + String(evt.type).split(":")[1]; // rest:short|long
+  } else if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
+    category = "decision";
+  } else {
+    return null; // not a persisted event
+  }
+
+  // Content (short, readable)
+  let content = "";
+  if (category === "combat:init") {
+    content = `Init ${evt.subtype === "end" ? "ended" : "started"}`;
+  } else if (category.startsWith("rest:")) {
+    const which = category.split(":")[1];
+    content = `Rest ${which} resolved`;
+  } else if (category === "decision") {
+    content = (evt.text && evt.text.length > 0) ? evt.text : "GM-directed action";
+  }
+
+  // Tags
+  const tags = (() => {
+    if (category === "combat:init") {
+      return `#init/${evt.subtype === "end" ? "end" : "start"}`;
+    }
+    if (category.startsWith("rest:")) {
+      return `#rest/${category.split(":")[1]}`;
+    }
+    if (category === "decision") {
+      return "#decision";
+    }
+    return null;
+  })();
+
+  return { category, content, tags };
+}
+
+// write gm_log with optional console mirror
+function writeGmLog({
+  guildId, channelId, partyId, sessionId,
+  category, content, tags,
+  adv = null, node = null,
+  visibility = "players",
+  created_by
+}) {
+  // DB write via your prepared statement
+  insGmLog.run(
+    guildId, channelId, partyId, sessionId,
+    category, content, tags,
+    adv, node,
+    visibility, null, null,
+    created_by, Date.now()
+  );
+
+  if (process.env.DEBUG_GMLOG === "1") {
+    console.log("[gm-log]", JSON.stringify({ guildId, channelId, partyId, sessionId, category, content, tags }));
+  }
+}
+
+
+
+
 function attachEventCapture(client) {
   client.on("messageCreate", (msg) => {
     // 1) basic guards
@@ -1934,7 +2010,33 @@ function isHighSignal(evt) {
 
 function logEvent(evt) {
   const important = isHighSignal(evt);
+
+  // Console always (dev visibility)
   console.log("[event-capture]", JSON.stringify({ ...evt, wouldWrite: important }));
+
+  // Persist only high-signal AND only when a session is active
+  if (important) {
+    const sessionId = getActiveSessionIdSafe(evt.guildId, evt.channelId);
+    if (!sessionId) return; // gated: don't persist outside sessions
+
+    const partyId = getActivePartyId?.(evt.guildId, evt.channelId) || null; // if you have this
+    const mapping = toGmLogRow(evt);
+    if (!mapping) return;
+
+    writeGmLog({
+      guildId: evt.guildId,
+      channelId: evt.channelId,
+      partyId,
+      sessionId,
+      category: mapping.category,
+      content: mapping.content,
+      tags: mapping.tags,
+      adv: currentAdvCode?.() || null,
+      node: currentNodeKey?.() || null,
+      visibility: "players",
+      created_by: evt.authorId || evt.authorTag || "system"
+    });
+  }
 }
 
 
@@ -6405,14 +6507,19 @@ client.on('interactionCreate', async (interaction) => {
           const after = getQtyForRow.get(guildId, channelId, partyId, item, unit);
           const newQty = Number(after?.qty) || 0;
           const unitStr = unit ? ` ${unit}` : '';
+          const itemSlug = item.toLowerCase().replace(/\s+/g, '-');
 
-          // Optional: audit trail in gm_logs
           insGmLog.run(
             guildId, channelId, partyId, getActiveSessionIdSafe(guildId, channelId),
-            'stash:add', `+${qty} ${item}${unitStr}${notes ? ` — ${notes}` : ''}`,
-            normTags(`#stash #${item.replace(/\s+/g, '-')}`), null, null,
-            'gm', null, null, interaction.user.id, Date.now()
+            'stash:add',
+            `+${qty}${unitStr} ${item}${notes ? ` — ${notes}` : ''}`,
+            normTags(`#stash #${itemSlug}`),
+            null, null,            // adv_code, node_key (fill if you have them)
+            'gm', null, null,
+            interaction.user.id,
+            Date.now()
           );
+
 
           // Reply — if brand new, don’t show the “now have” total
           if (wasNew) {
@@ -6492,12 +6599,18 @@ client.on('interactionCreate', async (interaction) => {
           );
           stashDeleteRowIfZero.run(guildId, channelId, partyId, item, unit);
 
-          // Optional audit trail in gm_logs
+          // compute a friendly unit string and an item slug once
+          const itemSlug = item.toLowerCase().replace(/\s+/g, '-');
+
           insGmLog.run(
             guildId, channelId, partyId, getActiveSessionIdSafe(guildId, channelId),
-            'stash:remove', `-${toRemove} ${item}${unitStr}`,
-            normTags(`#stash #${item.replace(/\s+/g, '-')}`), null, null,
-            'gm', null, null, interaction.user.id, Date.now()
+            'stash:remove',
+            `-${toRemove}${unitStr} ${item}`,
+            normTags(`#stash #${itemSlug}`),
+            null, null,
+            'gm', null, null,
+            interaction.user.id,
+            Date.now()
           );
 
           if (remaining <= 0) {
