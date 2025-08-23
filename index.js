@@ -550,6 +550,26 @@ function getActiveSessionIdSafe(guildId, channelId) {
   }
 }
 
+// Returns { session_id, party_id, adv_code, node_key } or null
+function getActiveSessionCtx(guildId, channelId) {
+  try {
+    const row = partyDb.prepare(`
+      SELECT s.id AS session_id, p.id AS party_id, s.adv_code, s.node_key
+      FROM parties p
+      JOIN party_sessions s ON s.party_id = p.id
+      WHERE p.guild_id = ? AND p.channel_id = ? AND p.is_active = 1
+        AND s.ended_at IS NULL
+      ORDER BY s.id DESC
+      LIMIT 1
+    `).get(guildId, channelId);
+    return row || null;
+  } catch (e) {
+    console.error("getActiveSessionCtx error", e);
+    return null;
+  }
+}
+
+
 // helper: unix seconds
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -1684,56 +1704,38 @@ function classifyAvraeInit(msg) {
 
   return null;
 }
-
-// Acquire active session id; return null if none (adjust to your util)
-function getActiveSessionIdSafe(guildId, channelId) {
-  try {
-    return getActiveSessionId(guildId, channelId); // if you already have this
-  } catch {
-    return null;
-  }
-}
-
 // Map our event to gm_logs fields
 function toGmLogRow(evt) {
-  // Category
-  let category = null;
+  // combat:init (start/end)
   if (evt.type === "combat:init") {
-    category = "combat:init"; // subtype will live in content
-  } else if (String(evt.type || "").startsWith("rest:")) {
-    category = "rest:" + String(evt.type).split(":")[1]; // rest:short|long
-  } else if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
-    category = "decision";
-  } else {
-    return null; // not a persisted event
+    const isEnd = evt.subtype === "end";
+    return {
+      category: "event:combat:init",
+      content: `Init ${isEnd ? "ended" : "started"}`,
+      tags: `#init/${isEnd ? "end" : "start"}`
+    };
   }
 
-  // Content (short, readable)
-  let content = "";
-  if (category === "combat:init") {
-    content = `Init ${evt.subtype === "end" ? "ended" : "started"}`;
-  } else if (category.startsWith("rest:")) {
-    const which = category.split(":")[1];
-    content = `Rest ${which} resolved`;
-  } else if (category === "decision") {
-    content = (evt.text && evt.text.length > 0) ? evt.text : "GM-directed action";
+  // rest:short | rest:long (resolution)
+  if (typeof evt.type === "string" && evt.type.startsWith("rest:")) {
+    const which = evt.type.split(":")[1]; // "short" | "long"
+    return {
+      category: `event:rest:${which}`,
+      content: `Rest ${which} resolved`,
+      tags: `#rest/${which}`
+    };
   }
 
-  // Tags
-  const tags = (() => {
-    if (category === "combat:init") {
-      return `#init/${evt.subtype === "end" ? "end" : "start"}`;
-    }
-    if (category.startsWith("rest:")) {
-      return `#rest/${category.split(":")[1]}`;
-    }
-    if (category === "decision") {
-      return "#decision";
-    }
-    return null;
-  })();
+  // GM-directed declared action (@bot ... or similar)
+  if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
+    return {
+      category: "event:decision",
+      content: (evt.text && evt.text.trim()) ? evt.text.trim() : "GM-directed action",
+      tags: "#decision"
+    };
+  }
 
-  return { category, content, tags };
+  return null; // not a persisted event
 }
 
 // write gm_log with optional console mirror
@@ -2011,33 +2013,37 @@ function isHighSignal(evt) {
 function logEvent(evt) {
   const important = isHighSignal(evt);
 
-  // Console always (dev visibility)
+  // Always mirror to console for dev
   console.log("[event-capture]", JSON.stringify({ ...evt, wouldWrite: important }));
 
-  // Persist only high-signal AND only when a session is active
-  if (important) {
-    const sessionId = getActiveSessionIdSafe(evt.guildId, evt.channelId);
-    if (!sessionId) return; // gated: don't persist outside sessions
+  if (!important) return;
 
-    const partyId = getActivePartyId?.(evt.guildId, evt.channelId) || null; // if you have this
-    const mapping = toGmLogRow(evt);
-    if (!mapping) return;
+  // GATE: only persist during an active session in this channel
+  const ctx = getActiveSessionCtx(evt.guildId, evt.channelId);
+  if (!ctx) return; // no active session → don't write to DB
 
+  const mapping = toGmLogRow(evt); // your mapper that produces {category, content, tags}
+  if (!mapping) return;
+
+  try {
     writeGmLog({
       guildId: evt.guildId,
       channelId: evt.channelId,
-      partyId,
-      sessionId,
-      category: mapping.category,
-      content: mapping.content,
-      tags: mapping.tags,
-      adv: currentAdvCode?.() || null,
-      node: currentNodeKey?.() || null,
+      partyId: ctx.party_id,
+      sessionId: ctx.session_id,
+      category: mapping.category,        // e.g., "event:combat:init"
+      content: mapping.content,          // e.g., "Init started"
+      tags: mapping.tags,                // e.g., "#init/start"
+      adv: ctx.adv_code || null,
+      node: ctx.node_key || null,
       visibility: "players",
       created_by: evt.authorId || evt.authorTag || "system"
     });
+  } catch (e) {
+    console.error("writeGmLog (events) failed", e);
   }
 }
+
 
 
 /* =========================
