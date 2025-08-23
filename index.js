@@ -1468,9 +1468,16 @@ try {
 
 // === Event Capture: safer minimal skeleton ===============================
 
-// Set this in your .env once you have it (Developer Mode → Copy ID on Avrae)
+// Config toggles
 const AVRAE_BOT_ID = process.env.AVRAE_BOT_ID || null;
+const LOG_PLAYER_CHECK_CMDS = process.env.LOG_PLAYER_CHECK_CMDS === 'true'; // default false
+const CORRELATE_CHECKS_MS = Number(process.env.CORRELATE_CHECKS_MS ?? 5000); // 5s window
 
+// Pending player checks (keyed by channel|author|skill)
+const pendingChecks = new Map(); // key -> { ts, evt }
+function pendingKey(msg, skill) {
+  return `${msg.channel?.id || 'na'}|${msg.author?.id || 'na'}|${(skill || 'unknown').toLowerCase()}`;
+}
 // quick guard against double-processing
 const seenMessageIds = new Set();
 
@@ -1490,19 +1497,40 @@ const RX_PLAYER_CHECK = /^!(check|skill|ability)\b/i;
 // - has an embed whose title/description mentions "check" or a known skill
 function looksLikeAvraeCheckResult(msg) {
   if (!msg.author?.bot) return false;
+
+  // Avrae identity
   if (AVRAE_BOT_ID) {
     if (msg.author.id !== AVRAE_BOT_ID) return false;
   } else {
     const name = (msg.author.username || msg.author.tag || "").toLowerCase();
     if (!name.includes("avrae")) return false;
   }
+
   const emb = (msg.embeds && msg.embeds[0]) || null;
   if (!emb) return false;
-  const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
-  if (hay.includes("check")) return true;
-  for (const s of SKILLS) if (hay.includes(s)) return true;
-  return false;
+
+  const title = (emb.title || "").toLowerCase();
+  const desc  = (emb.description || "").toLowerCase();
+
+  // Ignore the generic “active character” info embed
+  if (/your current active character/i.test(desc)) return false;
+
+  // Must look like a real check (avoid matching “checks” plural generically)
+  const hasCheckWord = /\bcheck\b/.test(title) || /\bcheck\b/.test(desc);
+
+  // Strong signal: “<Name> makes a <Skill> check!”
+  const looksLikeAvraeTitle = /\bmakes\b.+\bcheck\b/.test(title);
+
+  // Optional extra signal: skill name appears
+  let mentionsSkill = false;
+  if (!mentionsSkill) {
+    for (const s of SKILLS) { if (title.includes(s) || desc.includes(s)) { mentionsSkill = true; break; } }
+  }
+
+  // Require either a strong title OR (‘check’ word AND a skill mention)
+  return looksLikeAvraeTitle || (hasCheckWord && mentionsSkill);
 }
+
 
 function parsePlayerCheckCommand(content) {
   // "!check stealth adv" → {skill:"stealth", flags:"adv"}
@@ -1535,7 +1563,6 @@ function attachEventCapture(client) {
 
     const content = (msg.content || "").trim();
 
-    // 3) PLAYER COMMAND PATH: "!check ..."
     if (!msg.author?.bot && RX_PLAYER_CHECK.test(content)) {
       const { skill, flags } = parsePlayerCheckCommand(content);
       const evt = buildEvent({
@@ -1551,18 +1578,31 @@ function attachEventCapture(client) {
         authorId: msg.author?.id || null,
         authorTag: msg.author?.tag || msg.author?.username || null
       });
-      console.log("[event-capture]", JSON.stringify(evt));
+
+      // record intent for correlation; auto-expire
+      const key = pendingKey(msg, skill);
+      pendingChecks.set(key, { ts: Date.now(), evt });
+      setTimeout(() => pendingChecks.delete(key), CORRELATE_CHECKS_MS).unref?.();
+
+      // optional: show intent immediately (default: off)
+      if (LOG_PLAYER_CHECK_CMDS) {
+        if (typeof logEvent === 'function') {
+          logEvent(evt);
+        } else {
+          console.log("[event-capture]", JSON.stringify(evt));
+        }
+      }
       return;
     }
 
-    // 4) AVRAE RESULT PATH: embed with a check result
+
     if (looksLikeAvraeCheckResult(msg)) {
       const emb = msg.embeds[0];
       const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
       let skill = null;
       for (const s of SKILLS) if (hay.includes(s)) { skill = s; break; }
 
-      const evt = buildEvent({
+      let evt = buildEvent({
         source: "avrae-result",
         type: "event:roll",
         subtype: "check",
@@ -1575,8 +1615,83 @@ function attachEventCapture(client) {
         authorId: msg.author?.id || null,
         authorTag: msg.author?.tag || msg.author?.username || null
       });
-      console.log("[event-capture]", JSON.stringify(evt));
+
+      // correlate with recent player intent (same channel+author+skill)
+      const key = pendingKey(msg, skill);
+      const pend = pendingChecks.get(key);
+      if (pend && Date.now() - pend.ts <= CORRELATE_CHECKS_MS) {
+        pendingChecks.delete(key);
+        evt = {
+          ...evt,
+          source: "avrae-result+player-cmd",
+          flags: pend.evt.flags ?? evt.flags,
+          intentMsgId: pend.evt.messageId,
+          correlated: true
+        };
+      }
+      if (typeof logEvent === 'function') {
+        logEvent(evt);
+      } else {
+        console.log("[event-capture]", JSON.stringify(evt));
+      }
       return;
+    }
+    // Add these helpers inside attachEventCapture's messageCreate handler:
+
+    // Detect initiative start (very rough v1)
+    if (msg.content && /^!init\b/i.test(msg.content.trim())) {
+      const evt = {
+        ts: Date.now(),
+        source: msg.author?.bot ? "avrae-result" : "player-cmd",
+        type: "combat:init",
+        subtype: "start",
+        raw: msg.content,
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      };
+      return logEvent(evt);
+    }
+
+    // Detect rest (Avrae result or player intent)
+    if (/!shortrest\b|!longrest\b/i.test(msg.content || "")) {
+      const evt = {
+        ts: Date.now(),
+        source: msg.author?.bot ? "avrae-result" : "player-cmd",
+        type: "rest:" + (/longrest/i.test(msg.content) ? "long" : "short"),
+        subtype: "request",
+        raw: msg.content,
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      };
+      return logEvent(evt);
+    }
+
+    // Detect “directed at GM” declared actions (simple v1)
+    if (!msg.author?.bot) {
+      const content = (msg.content || "").trim();
+      if (/^(@gm|\/gm)\b/i.test(content) || /(^|\s)@YourBotName(\s|$)/i.test(content)) {
+        const evt = {
+          ts: Date.now(),
+          source: "player-freeform",
+          type: "decision",
+          subtype: "declared-action",
+          directed: true,
+          text: content.replace(/^(@gm|\/gm)\s*/i, ""),
+          raw: content,
+          guildId: msg.guildId,
+          channelId: msg.channel?.id || null,
+          messageId: msg.id,
+          authorId: msg.author?.id || null,
+          authorTag: msg.author?.tag || msg.author?.username || null
+        };
+        return logEvent(evt);
+      }
     }
 
     // else: ignore
@@ -1622,63 +1737,6 @@ function logEvent(evt) {
   const important = isHighSignal(evt);
   console.log("[event-capture]", JSON.stringify({ ...evt, wouldWrite: important }));
   // Step 3: if (important && sessionIsActiveFor(evt)) write to DB
-}
-// Add these helpers inside attachEventCapture's messageCreate handler:
-
-// Detect initiative start (very rough v1)
-if (msg.content && /^!init\b/i.test(msg.content.trim())) {
-  const evt = {
-    ts: Date.now(),
-    source: msg.author?.bot ? "avrae-result" : "player-cmd",
-    type: "combat:init",
-    subtype: "start",
-    raw: msg.content,
-    guildId: msg.guildId,
-    channelId: msg.channel?.id || null,
-    messageId: msg.id,
-    authorId: msg.author?.id || null,
-    authorTag: msg.author?.tag || msg.author?.username || null
-  };
-  return logEvent(evt);
-}
-
-// Detect rest (Avrae result or player intent)
-if (/!shortrest\b|!longrest\b/i.test(msg.content || "")) {
-  const evt = {
-    ts: Date.now(),
-    source: msg.author?.bot ? "avrae-result" : "player-cmd",
-    type: "rest:" + (/longrest/i.test(msg.content) ? "long" : "short"),
-    subtype: "request",
-    raw: msg.content,
-    guildId: msg.guildId,
-    channelId: msg.channel?.id || null,
-    messageId: msg.id,
-    authorId: msg.author?.id || null,
-    authorTag: msg.author?.tag || msg.author?.username || null
-  };
-  return logEvent(evt);
-}
-
-// Detect “directed at GM” declared actions (simple v1)
-if (!msg.author?.bot) {
-  const content = (msg.content || "").trim();
-  if (/^(@gm|\/gm)\b/i.test(content) || /(^|\s)@YourBotName(\s|$)/i.test(content)) {
-    const evt = {
-      ts: Date.now(),
-      source: "player-freeform",
-      type: "decision",
-      subtype: "declared-action",
-      directed: true,
-      text: content.replace(/^(@gm|\/gm)\s*/i, ""),
-      raw: content,
-      guildId: msg.guildId,
-      channelId: msg.channel?.id || null,
-      messageId: msg.id,
-      authorId: msg.author?.id || null,
-      authorTag: msg.author?.tag || msg.author?.username || null
-    };
-    return logEvent(evt);
-  }
 }
 
 
