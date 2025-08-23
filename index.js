@@ -1531,6 +1531,79 @@ function looksLikeAvraeCheckResult(msg) {
   return looksLikeAvraeTitle || (hasCheckWord && mentionsSkill);
 }
 
+// Matches: !shortrest, !longrest, !sr, !lr, !g sr, !g lr, !g shortrest, !g longrest
+const RX_REST_CMD = /^!(?:g\s+)?(?:(short\s*rest|long\s*rest)|sr|lr)\b/i;
+
+function parseRestSubtype(text) {
+  const t = (text || "").toLowerCase();
+  if (/\blong\s*rest\b|\blr\b/.test(t)) return "long";
+  return "short";
+}
+
+function looksLikeAvraeRestEmbed(msg) {
+  if (!msg.author?.bot) return false;
+  if (process.env.AVRAE_BOT_ID && msg.author.id !== process.env.AVRAE_BOT_ID) return false;
+  const emb = msg.embeds?.[0]; if (!emb) return false;
+  const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
+  // Avrae phrases vary; match the essentials:
+  // "takes a long rest", "long rest complete", "short rest", "regains hit dice", etc.
+  const longHit = /\blong\s*rest\b/.test(hay);
+  const shortHit = /\bshort\s*rest\b/.test(hay);
+  if (!longHit && !shortHit) return false;
+  return { subtype: longHit ? "long" : "short" };
+}
+
+const RX_INIT_CMD = /^!i(?:nit)?\b(?:\s+(start|begin|end|stop))?/i; // !init, !i, !init start/end
+
+function looksLikeAvraeInitEvent(msg) {
+  // must be a bot (prefer exact Avrae ID if provided)
+  if (!msg.author?.bot) return null;
+  const AV_ID = AVRAE_BOT_ID; // use your constant
+  if (AV_ID) {
+    if (msg.author.id !== AV_ID) return null;
+  } else {
+    const n = (msg.author.username || msg.author.tag || "").toLowerCase();
+    if (!n.includes("avrae")) return null;
+  }
+
+  const emb = Array.isArray(msg.embeds) && msg.embeds[0] ? msg.embeds[0] : null;
+  if (!emb) return null;
+
+  // Build a big haystack of text from the embed
+  const parts = [];
+  if (emb.title) parts.push(emb.title);
+  if (emb.description) parts.push(emb.description);
+  if (Array.isArray(emb.fields)) {
+    for (const f of emb.fields) {
+      if (f.name) parts.push(f.name);
+      if (f.value) parts.push(f.value);
+    }
+  }
+  if (emb.footer?.text) parts.push(emb.footer.text);
+
+  const hay = parts.join(" \n ").toLowerCase();
+
+  // Ignore non-combat “active character” informational embeds
+  if (/your current active character/i.test(hay)) return null;
+
+  // Does it look like an initiative/turn order message at all?
+  const mentionsInitiative =
+    /\binitiative\b/.test(hay) || /\bturn\s*order\b/.test(hay) || /\bround\b/.test(hay);
+
+  if (!mentionsInitiative) return null;
+
+  // Try to classify start/end/update
+  const isStart =
+    /\b(start|begin|begins|starting|entered|enter|roll(?:ed)?\s+initiative)\b/.test(hay) ||
+    /\bround\s*1\b/.test(hay);
+
+  const isEnd =
+    /\b(end|ended|finish|finished|stop|stopped|clear(?:ed)?|removed)\b/.test(hay) &&
+    /\binitiative\b/.test(hay);
+
+  const action = isStart ? "start" : isEnd ? "end" : "update";
+  return { action, embed: emb };
+}
 
 function parsePlayerCheckCommand(content) {
   // "!check stealth adv" → {skill:"stealth", flags:"adv"}
@@ -1550,6 +1623,68 @@ function buildEvent(base) {
   };
 }
 
+// Is this message directed at *our* bot?
+function directedAtBot(msg, client) {
+  const me = client.user?.id;
+  if (!me) return false;
+
+  // A real @mention of the bot: works for <@id> and <@!id>
+  if (msg.mentions?.users?.has?.(me)) return true;
+
+  // (Nice to have) replying to the bot counts as directed
+  if (msg.mentions?.repliedUser?.id === me) return true;
+
+  return false;
+}
+
+// Strip the bot mention out of the text so we keep the user's intent only
+function stripBotMention(text, client) {
+  const me = client.user?.id;
+  if (!text || !me) return text || "";
+  // remove <@id> or <@!id> once; trim extra spaces
+  return text.replace(new RegExp(`<@!?${me}>\\s*`, "g"), "").trim();
+}
+
+// Track init-start/end we've already logged for a given message edit sequence
+const processedInitActions = new Set(); // keys like `${messageId}|start` or `${messageId}|end`
+
+// Avrae INIT classifier: works on plain content and embeds.
+// Returns { action: "start" | "end" | "update", embed? } or null.
+function classifyAvraeInit(msg) {
+  if (!msg.author?.bot) return null;
+  const avId = process.env.AVRAE_BOT_ID;
+  if (avId) {
+    if (msg.author.id !== avId) return null;
+  } else {
+    const n = (msg.author.username || msg.author.tag || "").toLowerCase();
+    if (!n.includes("avrae")) return null;
+  }
+
+  const content = (msg.content || "").toLowerCase();
+
+  // ignore transient prompts in the edit chain
+  if (/are you sure you want to end combat/.test(content)) return null;
+  if (/^ok, ending\b/.test(content)) return null;
+
+  if (/roll\s+for\s+initiative/.test(content)) return { action: "start" };
+  if (/^combat ended\./.test(content))         return { action: "end" };
+
+  // (embed fallback, optional)
+  const emb = Array.isArray(msg.embeds) && msg.embeds[0] ? msg.embeds[0] : null;
+  if (emb) {
+    const chunks = [];
+    if (emb.title) chunks.push(emb.title);
+    if (emb.description) chunks.push(emb.description);
+    if (Array.isArray(emb.fields)) for (const f of emb.fields) { if (f.name) chunks.push(f.name); if (f.value) chunks.push(f.value); }
+    if (emb.footer?.text) chunks.push(emb.footer.text);
+    const hay = chunks.join("\n").toLowerCase();
+    if (/roll\s+for\s+initiative/.test(hay) || /\bround\s*1\b/.test(hay)) return { action: "start" };
+    if (/\binitiative\b/.test(hay) && /\b(end|ended|finish|finished|clear|cleared)\b/.test(hay)) return { action: "end" };
+  }
+
+  return null;
+}
+
 function attachEventCapture(client) {
   client.on("messageCreate", (msg) => {
     // 1) basic guards
@@ -1562,6 +1697,27 @@ function attachEventCapture(client) {
     if (me && msg.author?.id === me) return;
 
     const content = (msg.content || "").trim();
+
+    // 👉 NEW: GM-directed declared actions (human message that @mentions THIS bot)
+    if (!msg.author?.bot && directedAtBot(msg, client)) {
+      const text = stripBotMention(content, client);
+      const evt = {
+        ts: Date.now(),
+        source: "player-freeform",
+        type: "decision",
+        subtype: "declared-action",
+        directed: true,
+        text,
+        raw: content,
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      };
+      logEvent(evt);            // <- goes through your importance filter
+      return;                   // stop; we handled this message
+    }
 
     if (!msg.author?.bot && RX_PLAYER_CHECK.test(content)) {
       const { skill, flags } = parsePlayerCheckCommand(content);
@@ -1595,7 +1751,7 @@ function attachEventCapture(client) {
       return;
     }
 
-
+    //check, roll, detector
     if (looksLikeAvraeCheckResult(msg)) {
       const emb = msg.embeds[0];
       const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
@@ -1637,106 +1793,148 @@ function attachEventCapture(client) {
       return;
     }
     // Add these helpers inside attachEventCapture's messageCreate handler:
+    /* INIT by player command
+    if (!msg.author?.bot && RX_INIT_CMD.test(msg.content || "")) {
+      const m = (msg.content || "").match(RX_INIT_CMD);
+      const sub = (m && m[1]) ? (m[1].toLowerCase().startsWith("end") ? "end" : "start") : "start";
+      const evt = { ts: Date.now(), source: "player-cmd", type: "combat:init", subtype: sub,
+        raw: msg.content, guildId: msg.guildId, channelId: msg.channel?.id || null,
+        messageId: msg.id, authorId: msg.author?.id || null, authorTag: msg.author?.tag || msg.author?.username || null };
+      return logEvent(evt);
+    } */
 
-    // Detect initiative start (very rough v1)
-    if (msg.content && /^!init\b/i.test(msg.content.trim())) {
+    // INIT by Avrae (content or embed)
+    const init = classifyAvraeInit(msg);
+    if (init) {
+      const emb = msg.embeds?.[0];
       const evt = {
         ts: Date.now(),
-        source: msg.author?.bot ? "avrae-result" : "player-cmd",
+        source: "avrae-result",
         type: "combat:init",
-        subtype: "start",
-        raw: msg.content,
+        subtype: init.action, // "start" | "end" | "update"
+        raw: emb ? JSON.stringify({ title: emb.title || null, desc: emb.description || null })
+                : msg.content || "",
         guildId: msg.guildId,
         channelId: msg.channel?.id || null,
         messageId: msg.id,
         authorId: msg.author?.id || null,
         authorTag: msg.author?.tag || msg.author?.username || null
       };
-      return logEvent(evt);
+      logEvent(evt);
+      return;
     }
 
-    // Detect rest (Avrae result or player intent)
-    if (/!shortrest\b|!longrest\b/i.test(msg.content || "")) {
-      const evt = {
-        ts: Date.now(),
-        source: msg.author?.bot ? "avrae-result" : "player-cmd",
-        type: "rest:" + (/longrest/i.test(msg.content) ? "long" : "short"),
-        subtype: "request",
-        raw: msg.content,
-        guildId: msg.guildId,
-        channelId: msg.channel?.id || null,
-        messageId: msg.id,
-        authorId: msg.author?.id || null,
-        authorTag: msg.author?.tag || msg.author?.username || null
-      };
+    /* REST by player command or alias/macro
+    if (!msg.author?.bot && RX_REST_CMD.test(msg.content || "")) {
+      const sub = parseRestSubtype(msg.content || "");
+      const evt = { ts: Date.now(), source: "player-cmd", type: `rest:${sub}`, subtype: "request",
+        raw: msg.content, guildId: msg.guildId, channelId: msg.channel?.id || null,
+        messageId: msg.id, authorId: msg.author?.id || null, authorTag: msg.author?.tag || msg.author?.username || null };
       return logEvent(evt);
-    }
+    }*/
 
-    // Detect “directed at GM” declared actions (simple v1)
-    if (!msg.author?.bot) {
-      const content = (msg.content || "").trim();
-      if (/^(@gm|\/gm)\b/i.test(content) || /(^|\s)@YourBotName(\s|$)/i.test(content)) {
-        const evt = {
-          ts: Date.now(),
-          source: "player-freeform",
-          type: "decision",
-          subtype: "declared-action",
-          directed: true,
-          text: content.replace(/^(@gm|\/gm)\s*/i, ""),
-          raw: content,
-          guildId: msg.guildId,
-          channelId: msg.channel?.id || null,
-          messageId: msg.id,
-          authorId: msg.author?.id || null,
-          authorTag: msg.author?.tag || msg.author?.username || null
-        };
-        return logEvent(evt);
-      }
+    // REST by Avrae embed result
+    const restProbe = looksLikeAvraeRestEmbed(msg);
+    if (restProbe) {
+      const evt = { ts: Date.now(), source: "avrae-result", type: `rest:${restProbe.subtype}`, subtype: "resolve",
+        raw: JSON.stringify({ title: msg.embeds[0].title, desc: msg.embeds[0].description }),
+        guildId: msg.guildId, channelId: msg.channel?.id || null,
+        messageId: msg.id, authorId: msg.author?.id || null, authorTag: msg.author?.tag || msg.author?.username || null };
+      return logEvent(evt);
     }
 
     // else: ignore
   });
 }
 
+client.on("messageUpdate", async (oldMsg, newMsg) => {
+  try {
+    // Ensure we have full data on edits
+    let msg = newMsg;
+    if (msg?.partial) {
+      msg = await msg.fetch().catch(() => null);
+      if (!msg) return;
+    }
+
+    if (!msg.guildId) return; // ignore DMs
+
+    // Only care about Avrae edits that classify as INIT start/end/update
+    const init = classifyAvraeInit(msg);
+    if (!init) return;
+
+    // We only want to persist/log start/end as high-signal
+    if (init.action !== "start" && init.action !== "end") return;
+
+    // De-dupe per messageId+action (edits can fire multiple times)
+    const dkey = `${msg.id}|${init.action}`;
+    if (processedInitActions.has(dkey)) return;
+    processedInitActions.add(dkey);
+
+    const emb = msg.embeds?.[0];
+    const evt = {
+      ts: Date.now(),
+      source: "avrae-result",
+      type: "combat:init",
+      subtype: init.action, // "start" | "end"
+      raw: emb ? JSON.stringify({ title: emb.title || null, desc: emb.description || null }) : (msg.content || ""),
+      guildId: msg.guildId,
+      channelId: msg.channel?.id || null,
+      messageId: msg.id,
+      authorId: msg.author?.id || null,
+      authorTag: msg.author?.tag || msg.author?.username || null
+    };
+
+    // IMPORTANT: do not use your seenMessageIds guard here—this is an edit of an already-seen message
+    logEvent(evt); // goes through your isHighSignal() and should set wouldWrite:true for end
+  } catch (e) {
+    console.error("messageUpdate(init) failed", e);
+  }
+});
+
+
 // Call this once after your client logs in:
 attachEventCapture(client);
 
-// === /Event Capture =======================================================
-// === Event Capture: importance filter (no DB writes yet) ================
-
-// simple sliding window limiter to avoid spammy repeats
+// === Event Capture: importance filter (single canonical copy) ===
 const recentHash = new Set();
-function remember(key, ms = 15_000) {
+function remember(key, ms = 15000) {
   recentHash.add(key);
   setTimeout(() => recentHash.delete(key), ms).unref?.();
 }
 
 function isHighSignal(evt) {
-  // gate by session later; for now just classify
-  const t = `${evt.type}:${evt.subtype}`;
+  const [main, variant] = String(evt.type || "").split(":"); // e.g., "combat","init"
+  const chanKey = `${evt.channelId}|${evt.type}|${evt.subtype || ""}`;
 
-  // collapse repeats (same author+skill within 10s)
-  const dedupe = `${evt.source}|${t}|${evt.authorId}|${evt.skill||""}`;
-  if (recentHash.has(dedupe)) return false;
-  remember(dedupe, 10_000);
+  // INIT: only start/end are high-signal; updates are noisy
+  if (main === "combat" && variant === "init") {
+    if (evt.subtype === "start" || evt.subtype === "end") {
+      if (recentHash.has(chanKey)) return false;
+      remember(chanKey, 10000);
+      return true;
+    }
+    return false;
+  }
 
-  // initial high-signal set (expand later with scene state)
-  if (t === "combat:init") return true;
-  if (t === "rest:short" || t === "rest:long") return true;
-  if (t === "death:save" || t === "hp:downed") return true;
+  // REST resolutions (both short/long) are high-signal
+  if (main === "rest") {
+    if (recentHash.has(chanKey)) return false;
+    remember(chanKey, 8000);
+    return true;
+  }
 
-  // player declared action directed at GM (you can refine this)
-  if (evt.type === "decision" && evt.directed === true) return true;
+  // GM-directed declared actions
+  if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
+    return true;
+  }
 
-  // plain checks/attacks/saves are low-signal by default
+  // Everything else is low-signal for now
   return false;
 }
 
-// Wrap your existing console.log line in attachEventCapture:
 function logEvent(evt) {
   const important = isHighSignal(evt);
   console.log("[event-capture]", JSON.stringify({ ...evt, wouldWrite: important }));
-  // Step 3: if (important && sessionIsActiveFor(evt)) write to DB
 }
 
 
