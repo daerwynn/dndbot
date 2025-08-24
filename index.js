@@ -20,6 +20,9 @@ const INIT_LIST_CMD = process.env.AVRAE_INIT_LIST_CMD || '!init list';
 const rosterPromptAt = new Map(); // chId -> ts
 const ROSTER_PROMPT_COOLDOWN_MS = 30_000;
 
+const COMBAT_CAPTURE_MODE = (process.env.COMBAT_CAPTURE_MODE || 'signal').toLowerCase(); // 'signal' | 'full'
+const MODE_FULL = COMBAT_CAPTURE_MODE === 'full';
+
 // --- Embed safety helpers (avoid empty strings & overlong text) ---
 const EMBED_LIMITS = {
   title: 256,
@@ -176,6 +179,13 @@ async function registerGuildSlashCommandsSafe({
 }
 
 module.exports = { registerGuildSlashCommandsSafe };
+
+
+// === Debug flags ===
+const DEBUG_COMBAT = process.env.DEBUG_COMBAT === '1';           // set DEBUG_COMBAT=1 in .env
+const DEBUG_COMBAT_MAX_PRINT = Number(process.env.DEBUG_COMBAT_MAX_PRINT ?? 20);
+
+function cdbg(...args) { if (DEBUG_COMBAT) console.log('[combat]', ...args); }
 
 /* =========================
    NEW PARTY SYSTEM (party_id–scoped)
@@ -549,6 +559,26 @@ function getActiveSessionIdSafe(guildId, channelId) {
     return null;
   }
 }
+
+// Returns { session_id, party_id, adv_code, node_key } or null
+function getActiveSessionCtx(guildId, channelId) {
+  try {
+    const row = partyDb.prepare(`
+      SELECT s.id AS session_id, p.id AS party_id, s.adv_code, s.node_key
+      FROM parties p
+      JOIN party_sessions s ON s.party_id = p.id
+      WHERE p.guild_id = ? AND p.channel_id = ? AND p.is_active = 1
+        AND s.ended_at IS NULL
+      ORDER BY s.id DESC
+      LIMIT 1
+    `).get(guildId, channelId);
+    return row || null;
+  } catch (e) {
+    console.error("getActiveSessionCtx error", e);
+    return null;
+  }
+}
+
 
 // helper: unix seconds
 const now = () => Math.floor(Date.now() / 1000);
@@ -1464,6 +1494,1301 @@ try {
   console.log('Moves DB ready:', MOVES_DB_PATH);
 } catch (e) {
   console.warn('Moves DB open failed:', e.message);
+}
+
+// === Event Capture: safer minimal skeleton ===============================
+
+// Config toggles
+const AVRAE_BOT_ID = process.env.AVRAE_BOT_ID || null;
+const LOG_PLAYER_CHECK_CMDS = process.env.LOG_PLAYER_CHECK_CMDS === 'true'; // default false
+const CORRELATE_CHECKS_MS = Number(process.env.CORRELATE_CHECKS_MS ?? 5000); // 5s window
+
+// Pending player checks (keyed by channel|author|skill)
+const pendingChecks = new Map(); // key -> { ts, evt }
+function pendingKey(msg, skill) {
+  return `${msg.channel?.id || 'na'}|${msg.author?.id || 'na'}|${(skill || 'unknown').toLowerCase()}`;
+}
+// quick guard against double-processing
+const seenMessageIds = new Set();
+
+// Skills we recognize (lowercase)
+const SKILLS = new Set([
+  "acrobatics","animal","arcana","athletics","deception",
+  "history","insight","intimidation","investigation","medicine",
+  "nature","perception","performance","persuasion","religion",
+  "sleight","stealth","survival"
+]);
+
+// crude but safe command detector for players typing !check/!skill/!ability
+const RX_PLAYER_CHECK = /^!(check|skill|ability)\b/i;
+
+// Minimal Avrae result heuristic (we’ll harden later):
+// - author is Avrae (by ID if provided, else any bot named "Avrae")
+// - has an embed whose title/description mentions "check" or a known skill
+function looksLikeAvraeCheckResult(msg) {
+  if (!msg.author?.bot) return false;
+
+  // Avrae identity
+  if (AVRAE_BOT_ID) {
+    if (msg.author.id !== AVRAE_BOT_ID) return false;
+  } else {
+    const name = (msg.author.username || msg.author.tag || "").toLowerCase();
+    if (!name.includes("avrae")) return false;
+  }
+
+  const emb = (msg.embeds && msg.embeds[0]) || null;
+  if (!emb) return false;
+
+  const title = (emb.title || "").toLowerCase();
+  const desc  = (emb.description || "").toLowerCase();
+
+  // Ignore the generic “active character” info embed
+  if (/your current active character/i.test(desc)) return false;
+
+  // Must look like a real check (avoid matching “checks” plural generically)
+  const hasCheckWord = /\bcheck\b/.test(title) || /\bcheck\b/.test(desc);
+
+  // Strong signal: “<Name> makes a <Skill> check!”
+  const looksLikeAvraeTitle = /\bmakes\b.+\bcheck\b/.test(title);
+
+  // Optional extra signal: skill name appears
+  let mentionsSkill = false;
+  if (!mentionsSkill) {
+    for (const s of SKILLS) { if (title.includes(s) || desc.includes(s)) { mentionsSkill = true; break; } }
+  }
+
+  // Require either a strong title OR (‘check’ word AND a skill mention)
+  return looksLikeAvraeTitle || (hasCheckWord && mentionsSkill);
+}
+
+// Matches: !shortrest, !longrest, !sr, !lr, !g sr, !g lr, !g shortrest, !g longrest
+const RX_REST_CMD = /^!(?:g\s+)?(?:(short\s*rest|long\s*rest)|sr|lr)\b/i;
+
+function parseRestSubtype(text) {
+  const t = (text || "").toLowerCase();
+  if (/\blong\s*rest\b|\blr\b/.test(t)) return "long";
+  return "short";
+}
+
+function looksLikeAvraeRestEmbed(msg) {
+  if (!msg.author?.bot) return false;
+  if (process.env.AVRAE_BOT_ID && msg.author.id !== process.env.AVRAE_BOT_ID) return false;
+  const emb = msg.embeds?.[0]; if (!emb) return false;
+  const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
+  // Avrae phrases vary; match the essentials:
+  // "takes a long rest", "long rest complete", "short rest", "regains hit dice", etc.
+  const longHit = /\blong\s*rest\b/.test(hay);
+  const shortHit = /\bshort\s*rest\b/.test(hay);
+  if (!longHit && !shortHit) return false;
+  return { subtype: longHit ? "long" : "short" };
+}
+
+const RX_INIT_CMD = /^!i(?:nit)?\b(?:\s+(start|begin|end|stop))?/i; // !init, !i, !init start/end
+
+function looksLikeAvraeInitEvent(msg) {
+  // must be a bot (prefer exact Avrae ID if provided)
+  if (!msg.author?.bot) return null;
+  const AV_ID = AVRAE_BOT_ID; // use your constant
+  if (AV_ID) {
+    if (msg.author.id !== AV_ID) return null;
+  } else {
+    const n = (msg.author.username || msg.author.tag || "").toLowerCase();
+    if (!n.includes("avrae")) return null;
+  }
+
+  const emb = Array.isArray(msg.embeds) && msg.embeds[0] ? msg.embeds[0] : null;
+  if (!emb) return null;
+
+  // Build a big haystack of text from the embed
+  const parts = [];
+  if (emb.title) parts.push(emb.title);
+  if (emb.description) parts.push(emb.description);
+  if (Array.isArray(emb.fields)) {
+    for (const f of emb.fields) {
+      if (f.name) parts.push(f.name);
+      if (f.value) parts.push(f.value);
+    }
+  }
+  if (emb.footer?.text) parts.push(emb.footer.text);
+
+  const hay = parts.join(" \n ").toLowerCase();
+
+  // Ignore non-combat “active character” informational embeds
+  if (/your current active character/i.test(hay)) return null;
+
+  // Does it look like an initiative/turn order message at all?
+  const mentionsInitiative =
+    /\binitiative\b/.test(hay) || /\bturn\s*order\b/.test(hay) || /\bround\b/.test(hay);
+
+  if (!mentionsInitiative) return null;
+
+  // Try to classify start/end/update
+  const isStart =
+    /\b(start|begin|begins|starting|entered|enter|roll(?:ed)?\s+initiative)\b/.test(hay) ||
+    /\bround\s*1\b/.test(hay);
+
+  const isEnd =
+    /\b(end|ended|finish|finished|stop|stopped|clear(?:ed)?|removed)\b/.test(hay) &&
+    /\binitiative\b/.test(hay);
+
+  const action = isStart ? "start" : isEnd ? "end" : "update";
+  return { action, embed: emb };
+}
+
+function parsePlayerCheckCommand(content) {
+  // "!check stealth adv" → {skill:"stealth", flags:"adv"}
+  const parts = content.trim().slice(1).split(/\s+/); // drop "!"
+  const [, maybeSkill, ...rest] = parts;              // ["check","stealth","adv"]
+  const skill = (maybeSkill || "").toLowerCase();
+  return {
+    skill: SKILLS.has(skill) ? skill : null,
+    flags: rest.join(" ") || null
+  };
+}
+
+function buildEvent(base) {
+  return {
+    ts: Date.now(),
+    ...base
+  };
+}
+
+// Is this message directed at *our* bot?
+function directedAtBot(msg, client) {
+  const me = client.user?.id;
+  if (!me) return false;
+
+  // A real @mention of the bot: works for <@id> and <@!id>
+  if (msg.mentions?.users?.has?.(me)) return true;
+
+  // (Nice to have) replying to the bot counts as directed
+  if (msg.mentions?.repliedUser?.id === me) return true;
+
+  return false;
+}
+
+// Strip the bot mention out of the text so we keep the user's intent only
+function stripBotMention(text, client) {
+  const me = client.user?.id;
+  if (!text || !me) return text || "";
+  // remove <@id> or <@!id> once; trim extra spaces
+  return text.replace(new RegExp(`<@!?${me}>\\s*`, "g"), "").trim();
+}
+
+// Track init-start/end we've already logged for a given message edit sequence
+const processedInitActions = new Set(); // keys like `${messageId}|start` or `${messageId}|end`
+
+// Avrae INIT classifier: works on plain content and embeds.
+// Returns { action: "start" | "end" } or null.
+// Avrae INIT classifier: detect start/end from Avrae only.
+// Returns { action: "start" | "end" } or null.
+function classifyAvraeInit(msg) {
+  if (!msg.author?.bot) return null;
+  const avId = process.env.AVRAE_BOT_ID;
+  if (avId ? msg.author.id !== avId
+           : !((msg.author.username || msg.author.tag || '').toLowerCase().includes('avrae'))) return null;
+
+  // Build haystack from content + embed text
+  const parts = [];
+  if (msg.content) parts.push(msg.content);
+  const emb = Array.isArray(msg.embeds) && msg.embeds[0] ? msg.embeds[0] : null;
+  if (emb) {
+    if (emb.title) parts.push(emb.title);
+    if (emb.description) parts.push(emb.description);
+    if (Array.isArray(emb.fields)) for (const f of emb.fields) { if (f.name) parts.push(f.name); if (f.value) parts.push(f.value); }
+    if (emb.footer?.text) parts.push(emb.footer.text);
+  }
+  const hay = parts.join('\n').toLowerCase();
+
+  // Ignore noise & prompts
+  if (/are you sure you want to end combat/.test(hay)) return null;      // transient prompt
+  if (/^ok,\s*ending\b/.test(hay)) return null;                          // transient ack
+  if (/^```md?\n?current initiative:/i.test(hay)) return null;           // scoreboard cards
+  if (/^```.*awaiting combatants/i.test(hay)) return null;               // staging card
+
+  // Start cues: the initial call or the first round banner title (not the scoreboard)
+  if (/(^|\s)roll\s+for\s+initiative\b/.test(hay) ||
+      /^\s*\**initiative\s+\d+\s*\(round\s*1\)/.test(hay)) {
+    cdbg('INIT MATCH start');
+    return { action: 'start' };
+  }
+
+  // End cues
+  if (/\bcombat(?:\s+has)?\s+ended\b/.test(hay)) {
+    cdbg('INIT MATCH end');
+    return { action: 'end' };
+  }
+
+  if (DEBUG_COMBAT) {
+    const emb = Array.isArray(msg.embeds) && msg.embeds[0] ? msg.embeds[0] : null;
+    const prev = (msg.content || emb?.title || '').slice(0, 120);
+    cdbg('INIT? no match', { preview: prev });
+  }
+  return null;
+}
+
+
+
+// Map our event to gm_logs fields
+function toGmLogRow(evt) {
+  // combat:init (start/end)
+  if (evt.type === "combat:init") {
+    const isEnd = evt.subtype === "end";
+    return {
+      category: "event:combat:init",
+      content: `Initiative ${isEnd ? "ended" : "started"}`,
+      tags: `#init/${isEnd ? "end" : "start"}`
+    };
+  }
+
+  // rest:short | rest:long (resolution)
+  if (typeof evt.type === "string" && evt.type.startsWith("rest:")) {
+    const which = evt.type.split(":")[1]; // "short" | "long"
+    return {
+      category: `event:rest:${which}`,
+      content: `Rest ${which} resolved`,
+      tags: `#rest/${which}`
+    };
+  }
+
+  // GM-directed declared action (@bot ... or similar)
+  if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
+    return {
+      category: "event:decision",
+      content: (evt.text && evt.text.trim()) ? evt.text.trim() : "GM-directed action",
+      tags: "#decision"
+    };
+  }
+
+  return null; // not a persisted event
+}
+
+// write gm_log with optional console mirror
+function writeGmLog({
+  guildId, channelId, partyId, sessionId,
+  category, content, tags,
+  adv = null, node = null,
+  visibility = "players",
+  created_by
+}) {
+  // DB write via your prepared statement
+  insGmLog.run(
+    guildId, channelId, partyId, sessionId,
+    category, content, tags,
+    adv, node,
+    visibility, null, null,
+    created_by, Date.now()
+  );
+
+  if (process.env.DEBUG_GMLOG === "1") {
+    console.log("[gm-log]", JSON.stringify({ guildId, channelId, partyId, sessionId, category, content, tags }));
+  }
+}
+
+
+// Get the last finished session for this channel's active party
+function getLastFinishedSessionId(guildId, channelId) {
+  try {
+    const row = partyDb.prepare(`
+      SELECT s.id
+      FROM parties p
+      JOIN party_sessions s ON s.party_id = p.id
+      WHERE p.guild_id = ? AND p.channel_id = ? AND p.is_active = 1
+        AND s.ended_at IS NOT NULL
+      ORDER BY s.id DESC
+      LIMIT 1
+    `).get(guildId, channelId);
+    return row?.id || null;
+  } catch (e) {
+    console.error('getLastFinishedSessionId error', e);
+    return null;
+  }
+}
+
+// Pull only high-signal events for a specific session
+function getEventLogsForSession(sessionId, limit = 50) {
+  try {
+    return partyDb.prepare(`
+      SELECT category, content, tags, created_at
+      FROM gm_logs
+      WHERE session_id = ? AND category LIKE 'event:%'
+      ORDER BY id ASC
+      LIMIT ?
+    `).all(sessionId, limit);
+  } catch (e) {
+    console.error('getEventLogsForSession error', e);
+    return [];
+  }
+}
+
+// Render compact, readable recap lines
+function formatRecapLines(rows) {
+  const lines = [];
+
+  for (const r of rows) {
+    // Prefer a single Combat Summary over separate init start/end bullets.
+    if (r.category === 'event:combat:summary') {
+      lines.push(`• Combat summary — ${r.content}`);
+      continue;
+    }
+
+    // Skip raw init rows in the recap (they're still in gm_logs for audit)
+    if (r.category === 'event:combat:init') {
+      // If you really want to show them, uncomment:
+      // const ended = /\b#init\/end\b/.test(r.tags || '') || /ended/i.test(r.content || '');
+      // lines.push(`• Initiative ${ended ? 'ended' : 'started'}`);
+      continue;
+    }
+
+    if (r.category === 'event:rest:short') {
+      lines.push('• Short rest completed');
+      continue;
+    }
+    if (r.category === 'event:rest:long') {
+      lines.push('• Long rest completed');
+      continue;
+    }
+    if (r.category === 'event:decision') {
+      lines.push(`• Decision: ${r.content}`);
+      continue;
+    }
+
+    // Fallback for any other event:% types you add later
+    const cat = (r.category || '').replace(/^event:/, '');
+    lines.push(`• ${cat}: ${r.content}`);
+  }
+
+  return lines;
+}
+
+// Track combat stats per channel while combat is active
+const combatAgg = new Map(); // channelId -> { startTs, downed, dsSuccess, dsFail }
+
+function combatAggOnStart(channelId) {
+  combatAgg.set(channelId, { startTs: Date.now(), downed: 0, dsSuccess: 0, dsFail: 0 });
+}
+
+function combatAggOnDowned(channelId) {
+  const st = combatAgg.get(channelId);
+  if (st) st.downed++;
+}
+
+function combatAggOnDeathSave(channelId, result /* 'success'|'fail'|null */) {
+  const st = combatAgg.get(channelId);
+  if (!st) return;
+  if (result === 'success') st.dsSuccess++;
+  else if (result === 'fail') st.dsFail++;
+}
+
+function combatAggOnEnd(evt /* uses guildId/channelId for ctx */) {
+  const st = combatAgg.get(evt.channelId);
+  if (!st) return;
+  const mins = Math.max(1, Math.round((Date.now() - st.startTs) / 60000));
+  const content = `duration ${mins}m · downed ${st.downed} · death saves S:${st.dsSuccess} F:${st.dsFail}`;
+
+  // tie to the active (just-ended) session context
+  const ctx = getActiveSessionCtx(evt.guildId, evt.channelId);
+  if (ctx) {
+    writeGmLog({
+      guildId: evt.guildId,
+      channelId: evt.channelId,
+      partyId: ctx.party_id,
+      sessionId: ctx.session_id,
+      category: 'event:combat:summary',
+      content,
+      tags: '#combat/summary',
+      adv: ctx.adv_code || null,
+      node: ctx.node_key || null,
+      visibility: 'players',
+      created_by: evt.authorId || 'system'
+    });
+  }
+
+  combatAgg.delete(evt.channelId);
+}
+
+// ---------- Combat transcript capture & summarization ----------
+
+// config
+const COMBAT_SUMMARY_GPT = process.env.COMBAT_SUMMARY_GPT === '1';
+const COMBAT_SUMMARY_MAX_LINES = Number(process.env.COMBAT_SUMMARY_MAX_LINES ?? 120);
+
+// GPT client (lazy)
+let _openai = null;
+function getOpenAI() {
+  if (!COMBAT_SUMMARY_GPT || !process.env.OPENAI_API_KEY) return null;
+  if (_openai) return _openai;
+  try {
+    const { OpenAI } = require('openai');
+    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  } catch (e) {
+    console.warn('OpenAI not available; falling back to heuristic summary.');
+    _openai = null;
+  }
+  return _openai;
+}
+
+// transcript store per channel
+// shape: { startTs, items: [{id, t, author, title, desc, content}], seen: Set<string> }
+const combatTx = new Map();
+
+function combatCaptureStart(channelId) {
+  combatTx.set(channelId, { startTs: Date.now(), items: [], seen: new Set() });
+  cdbg('START', { channelId });
+}
+
+function combatCaptureStop(channelId) {
+  const st = combatTx.get(channelId);
+  combatTx.delete(channelId);
+  cdbg('STOP', { channelId, hadItems: !!(st && st.items && st.items.length) });
+  return st || null;
+}
+
+
+// Only keep Avrae messages that look combat-relevant
+function looksCombatRelevant(msg) {
+  // Avrae only
+  const avId = process.env.AVRAE_BOT_ID;
+  if (!msg?.author?.bot) return false;
+  const isAvrae = avId
+    ? msg.author.id === avId
+    : ((msg.author.username || msg.author.tag || '').toLowerCase().includes('avrae'));
+  if (!isAvrae) return false;
+
+  // Build a rich haystack: content + embed title/description/fields/footer
+  const emb = msg.embeds?.[0];
+  const parts = [];
+  if (msg.content) parts.push(msg.content);
+  if (emb?.title) parts.push(emb.title);
+  if (emb?.description) parts.push(emb.description);
+  if (Array.isArray(emb?.fields)) {
+    for (const f of emb.fields) {
+      if (f?.name)  parts.push(String(f.name));
+      if (f?.value) parts.push(String(f.value));
+    }
+  }
+  if (emb?.footer?.text) parts.push(emb.footer.text);
+  const text = parts.join('\n').toLowerCase();
+
+  // --- noise (drop these) ---
+  if (/your current active character/.test(text)) return false;
+  if (/^```md?\s*current initiative:/i.test(text)) return false;   // scoreboard cards
+  if (/^```.*awaiting combatants/i.test(text)) return false;       // staging card
+  if (/multiple matches found|which one were you looking for\?|selection timed out|cancelled/i.test(text)) return false;
+
+  // --- signals (keep these) ---
+
+  // Initiative begin cue (Avrae's "!init begin" post)
+  if (/(^|\s)roll\s+for\s+initiative\b/.test(text)) return true;
+
+  // Round banner like "**Initiative 12 (round 1)**: Aegis (...)"
+  if (/\b(?:\*\*)?initiative\s+\d+\s*\(round\s*\d+\)/i.test(text)) return true;
+
+  // Added to combat (useful early signal)
+  if (/\bwas added to combat\b/i.test(text)) return true;
+
+  // Attack/defense flow cues
+  if (/\b(attacks?|to hit|hits?|miss(?:es)?|damage|dmg|critical|crit|save\b|saving throw|casts?)\b/.test(text)) return true;
+
+  // HP state like "<5/20 HP>"
+  if (/<\s*\d+\s*\/\s*\d+\s*hp\s*>/i.test(text)) return true;
+
+  // Downed / death-save / 0 HP etc.
+  if (/\b(0\s*hp|unconscious|knocked\s+unconscious|drops?\s+to\s+0|death\s+save|stabiliz(?:e|ed))\b/.test(text)) return true;
+
+  return false;
+}
+
+
+function joinFields(emb) {
+  if (!Array.isArray(emb?.fields)) return '';
+  const bits = [];
+  for (const f of emb.fields) {
+    if (f?.name)  bits.push(String(f.name));
+    if (f?.value) bits.push(String(f.value));
+  }
+  return bits.join(' ');
+}
+
+function longer(a, b) {
+  return (b && (!a || b.length > a.length)) ? b : a;
+}
+
+function upsertCombatLine(msg) {
+  const chId = msg.channel?.id;
+  const st = combatTx.get(chId);
+  if (!st) return;
+
+  const emb = msg.embeds?.[0];
+  const next = {
+    id: msg.id,
+    t: msg.createdTimestamp || Date.now(),
+    author: msg.author?.username || msg.author?.tag || 'Unknown',
+    authorId: msg.author?.id || null,
+    isBot: !!msg.author?.bot,
+    title: emb?.title || null,
+    desc: emb?.description || null,
+    fields: joinFields(emb) || null,
+    content: msg.content || null
+  };
+
+  const idx = st.items.findIndex(it => it.id === msg.id);
+  if (idx >= 0) {
+    const it = st.items[idx];
+    it.title   = longer(it.title,   next.title);
+    it.desc    = longer(it.desc,    next.desc);
+    it.fields  = longer(it.fields,  next.fields);
+    it.content = longer(it.content, next.content);
+    cdbg('LINE* update', { chId, id: msg.id, hasDesc: !!it.desc, hasFields: !!it.fields });
+  } else {
+    st.items.push(next);
+    st.seen.add(msg.id);
+    const clean = cleanLine(next).slice(0, 140);
+    cdbg('LINE+', { chId, count: st.items.length, preview: clean, mode: COMBAT_CAPTURE_MODE });
+  }
+
+  if (st.items.length > COMBAT_SUMMARY_MAX_LINES) {
+    st.items.splice(0, st.items.length - COMBAT_SUMMARY_MAX_LINES);
+  }
+}
+
+
+
+// A tiny cleaner that strips dice math fluff
+function cleanLine({ title, desc, content, fields, author, isBot }) {
+  // For human messages (RP/GM), show "Author: message"
+  if (!isBot && (content || '').trim()) {
+    return `${author}: ${content.trim()}`.slice(0, 300);
+  }
+
+  // For Avrae (or other bots), keep structured view; trim initiative banner noise
+  let left = title || content || '';
+  left = left.replace(/^\s*\*{0,2}initiative\s+\d+\s*\(round\s*\d+\)\*{0,2}:\s*/i, '');
+
+  const right = [desc || '', fields || '']
+    .join(' ')
+    .replace(/`[^`]+`/g, '')
+    .replace(/\(\s*\d+d\d+(?:\s*[+\-]\s*\d+)?\s*\)/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return [left, right].filter(Boolean).join(' — ').trim();
+}
+
+
+// Heuristic summary (fallback when GPT is off)
+function summarizeHeuristic(items, ms) {
+  let hits=0, misses=0, crits=0, heals=0, deathS=0, downed=0;
+
+  // Track lowest (current / max) HP snapshot by actor
+  let minHpRatio = 1, minHpStr = null; // e.g., "Aegis 5/20"
+  const hpRx = /([A-Za-z][\w' -]{0,24})\s*<\s*(\d+)\s*\/\s*(\d+)\s*hp\s*>/i;
+
+  for (const it of items) {
+    const l = `${(it.title||'').toLowerCase()} ${(it.desc||'').toLowerCase()} ${(it.fields||'').toLowerCase()} ${(it.content||'').toLowerCase()}`;
+
+    // explicit miss
+    if (/\bmiss!?/.test(l)) { misses++; }
+
+    // hits/damage markers
+    if (/\bhits?\b/.test(l) || /\bhit:\b/.test(l) || /\bdamage:\b/.test(l)) hits++;
+
+    // crits
+    if (/\bcrit(ical)?\b/.test(l)) crits++;
+
+    // heals
+    if (/\bheals?\b/.test(l) || /\bheal:\b/.test(l)) heals++;
+
+    // death saves
+    if (/\bdeath\s+saving\s+throw\b/.test(l)) deathS++;
+
+    // downed / 0hp
+    if (/<\s*0\s*\/\s*\d+\s*hp\s*>/.test(l) || /\b(0\s*hp|unconscious|knocked\s+unconscious|drops?\s+to\s+0)\b/.test(l)) {
+      downed++;
+    }
+
+    // lowest HP snapshot
+    const m = hpRx.exec((it.title || '') + ' ' + (it.desc || '') + ' ' + (it.fields || ''));
+    if (m) {
+      const name = m[1].trim();
+      const cur  = parseInt(m[2], 10);
+      const max  = parseInt(m[3], 10) || 1;
+      const ratio = Math.max(0, Math.min(1, cur / max));
+      if (ratio < minHpRatio) {
+        minHpRatio = ratio;
+        minHpStr = `${name} ${cur}/${max}`;
+      }
+    }
+  }
+
+  const mins = Math.max(1, Math.round(ms/60000));
+  const parts = [];
+  parts.push(`A ${mins}-minute skirmish`);
+  const stats = [
+    `${hits} hits${crits ? ` (${crits} crits)` : ''}`,
+    `${misses} misses`,
+    heals ? `${heals} heals` : null,
+    downed ? `${downed} downed` : null,
+    deathS ? `${deathS} death saves` : null,
+  ].filter(Boolean);
+
+  let out = parts.join(' — ') + (stats.length ? ': ' + stats.join(', ') : '') + '.';
+  if (minHpStr) out += ` Lowest HP: ${minHpStr}.`;
+  return out;
+}
+
+
+
+// GPT summary (returns null on failure)
+async function summarizeWithGPT(items, ms, participants, outcome) {
+  const openai = getOpenAI();
+  if (!openai) return null;
+
+  const mins = Math.max(1, Math.round(ms/60000));
+  const bullets = items.map(cleanLine).filter(Boolean).slice(-COMBAT_SUMMARY_MAX_LINES);
+
+  const parts = [];
+  if (participants?.pcs?.length) parts.push(`Party: ${participants.pcs.join(', ')}`);
+  if (participants?.npcs?.length) parts.push(`Opponents (as logged): ${participants.npcs.join(', ')}`);
+  if (outcome?.downed?.length) parts.push(`Downed: ${outcome.downed.join(', ')}`);
+  if (outcome?.finisher) parts.push(`Likely finisher: ${outcome.finisher}`);
+  const contextLines = parts.join('\n');
+
+  const system = `You summarize D&D combat logs faithfully. Do not invent entities. Prefer names exactly as logged (e.g., "OG1").`;
+  const user = [
+    `Summarize this combat in 2–4 sentences, past tense, concise and cinematic.`,
+    `Mention key blows, crits, any character that dropped to 0 HP, and the turning point.`,
+    `Avoid raw dice/math; use names as shown. Duration: ~${mins} minutes.`,
+    contextLines ? `\nContext:\n${contextLines}` : ``,
+    `\nLog lines:`,
+    ...bullets.map(b => `- ${b}`)
+  ].join('\n');
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: process.env.COMBAT_SUMMARY_MODEL || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user }
+      ],
+      max_tokens: 140,
+      temperature: 0.6
+    });
+    return (resp.choices?.[0]?.message?.content || '').trim() || null;
+  } catch (e) {
+    console.warn('GPT combat summary failed:', e.message);
+    return null;
+  }
+}
+
+
+// Compose and persist the final summary row
+async function writeCombatSummaryFromTranscript(evt) {
+  const st = combatCaptureStop(evt.channelId);
+  if (!st) { cdbg('FLUSH: no state'); return; }
+  if (!st.items.length) { cdbg('FLUSH: empty'); return; }
+
+  const durationMs = Date.now() - st.startTs;
+
+  const previews = st.items.slice(-DEBUG_COMBAT_MAX_PRINT).map((it, i) => `${String(i+1).padStart(2,'0')}. ${cleanLine(it)}`);
+  cdbg('FLUSH begin', { chId: evt.channelId, count: st.items.length, durationMs });
+  if (DEBUG_COMBAT) console.log('[combat-transcript]\n' + previews.join('\n'));
+
+  const ctx = getActiveSessionCtx(evt.guildId, evt.channelId);
+  if (!ctx) { cdbg('SKIP WRITE: no active session context'); return; }
+
+  const roster = getActivePartyRosterNames(ctx);
+  const participants = extractParticipantsFromTranscript(st.items, roster);
+  const outcome = extractOutcomeHints(st.items);
+  cdbg('PARTICIPANTS', participants); cdbg('OUTCOME', outcome);
+
+  let summary = await summarizeWithGPT(st.items, durationMs, participants, outcome);
+  if (!summary) {
+    // Fallback heuristic (reuse yours) + append sides/outcome for clarity
+    let base = summarizeHeuristic(st.items, durationMs);
+    const add = [];
+    if (participants.pcs.length) add.push(`Party: ${participants.pcs.join(', ')}`);
+    if (participants.npcs.length) add.push(`Foes: ${participants.npcs.join(', ')}`);
+    if (outcome.downed.length) add.push(`Downed: ${outcome.downed.join(', ')}`);
+    if (outcome.finisher) add.push(`Finisher: ${outcome.finisher}`);
+    summary = [base, ...add].join(' ');
+  }
+
+  writeGmLog({
+    guildId: evt.guildId,
+    channelId: evt.channelId,
+    partyId: ctx.party_id,
+    sessionId: ctx.session_id,
+    category: 'event:combat:summary',
+    content: summary,
+    tags: '#combat/summary',
+    adv: ctx.adv_code || null,
+    node: ctx.node_key || null,
+    visibility: 'players',
+    created_by: evt.authorId || 'system'
+  });
+
+  if (process.env.DEBUG_GMLOG === '1') console.log('[combat-summary]', summary);
+  cdbg('WRITE OK', { sessionId: ctx.session_id });
+}
+
+// ----------------------------------------------------------------
+
+
+// --- Harvest Avrae combat lines during active combat ---------------------
+function tryHarvestCombatLine(msg) {
+  const chId = msg?.channel?.id;
+  if (!chId || !msg.guildId) return;
+
+  const active   = combatTx.has(chId);
+  const relevant = MODE_FULL ? true : looksCombatRelevant(msg);
+
+  // In FULL mode we still need a gate; rely on init:start or opportunistic arm
+  if (!active) {
+    if (!relevant) { cdbg('HARV skip (no active transcript)', { chId }); return; }
+    cdbg('AUTO-START (harvest)', { chId, reason: MODE_FULL ? 'full-mode first line' : 'first relevant Avrae line' });
+    combatCaptureStart(chId);
+  }
+
+  // In FULL mode, include humans + Avrae; skip this bot’s own messages
+  if (MODE_FULL) {
+    if (msg.author?.id === globalThis.BOT_USER_ID) return; // skip ourselves
+    // (Optionally drop Discord service/system messages if needed)
+  } else {
+    // Signal mode: only keep relevant lines (Avrae attacks, HP, etc.)
+    if (!relevant) {
+      cdbg('HARV drop (irrelevant)', { chId, id: msg.id, preview: (msg.embeds?.[0]?.title || msg.content || '').slice(0, 80) });
+      return;
+    }
+  }
+
+  cdbg('HARV keep candidate', { chId, id: msg.id, mode: COMBAT_CAPTURE_MODE });
+  upsertCombatLine(msg); // merges edits/fields
+}
+
+
+
+function attachCombatTranscriptHarvest(client) {
+  // New, separate listener for new messages
+  client.on("messageCreate", (msg) => {
+    tryHarvestCombatLine(msg);
+  });
+
+  // New, separate listener for edited messages (Avrae sometimes edits in-place)
+  client.on("messageUpdate", async (oldMsg, newMsg) => {
+    try {
+      let msg = newMsg;
+      // If the update is partial, fetch full data so embeds/description are available
+      if (msg?.partial) {
+        msg = await msg.fetch().catch(() => null);
+        if (!msg) return;
+      }
+      tryHarvestCombatLine(msg);
+    } catch (e) {
+      console.error("combat transcript harvest (update) failed:", e);
+    }
+  });
+}
+
+//EVENT CAPTURE STUFF
+
+function attachEventCapture(client) {
+  client.on("messageCreate", (msg) => {
+    // 1) basic guards
+    if (!msg.guildId) return;                    // ignore DMs
+    if (seenMessageIds.has(msg.id)) return;      // idempotent guard
+    seenMessageIds.add(msg.id);
+
+    // 2) ignore ourselves always
+    const me = client.user?.id;
+    if (me && msg.author?.id === me) return;
+
+    const content = (msg.content || "").trim();
+
+    // 👉 NEW: GM-directed declared actions (human message that @mentions THIS bot)
+    if (!msg.author?.bot && directedAtBot(msg, client)) {
+      const text = stripBotMention(content, client);
+      const evt = {
+        ts: Date.now(),
+        source: "player-freeform",
+        type: "decision",
+        subtype: "declared-action",
+        directed: true,
+        text,
+        raw: content,
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      };
+      logEvent(evt);            // <- goes through your importance filter
+      return;                   // stop; we handled this message
+    }
+
+    if (!msg.author?.bot && RX_PLAYER_CHECK.test(content)) {
+      const { skill, flags } = parsePlayerCheckCommand(content);
+      const evt = buildEvent({
+        source: "player-cmd",
+        type: "event:roll",
+        subtype: "check",
+        skill,
+        flags,
+        raw: content,
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      });
+
+      // record intent for correlation; auto-expire
+      const key = pendingKey(msg, skill);
+      pendingChecks.set(key, { ts: Date.now(), evt });
+      setTimeout(() => pendingChecks.delete(key), CORRELATE_CHECKS_MS).unref?.();
+
+      // optional: show intent immediately (default: off)
+      if (LOG_PLAYER_CHECK_CMDS) {
+        if (typeof logEvent === 'function') {
+          logEvent(evt);
+        } else {
+          console.log("[event-capture]", JSON.stringify(evt));
+        }
+      }
+      return;
+    }
+
+    //check, roll, detector
+    if (looksLikeAvraeCheckResult(msg)) {
+      const emb = msg.embeds[0];
+      const hay = `${emb.title || ""} ${emb.description || ""}`.toLowerCase();
+      let skill = null;
+      for (const s of SKILLS) if (hay.includes(s)) { skill = s; break; }
+
+      let evt = buildEvent({
+        source: "avrae-result",
+        type: "event:roll",
+        subtype: "check",
+        skill,
+        flags: null,
+        raw: JSON.stringify({ title: emb.title, desc: emb.description }),
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      });
+
+      // correlate with recent player intent (same channel+author+skill)
+      const key = pendingKey(msg, skill);
+      const pend = pendingChecks.get(key);
+      if (pend && Date.now() - pend.ts <= CORRELATE_CHECKS_MS) {
+        pendingChecks.delete(key);
+        evt = {
+          ...evt,
+          source: "avrae-result+player-cmd",
+          flags: pend.evt.flags ?? evt.flags,
+          intentMsgId: pend.evt.messageId,
+          correlated: true
+        };
+      }
+      if (typeof logEvent === 'function') {
+        logEvent(evt);
+      } else {
+        console.log("[event-capture]", JSON.stringify(evt));
+      }
+      return;
+    }
+
+    // INIT by Avrae (content or embed)
+    const init = classifyAvraeInit(msg);
+    if (init) {
+      const emb = msg.embeds?.[0];
+      const evt = {
+        ts: Date.now(),
+        source: "avrae-result",
+        type: "combat:init",
+        subtype: init.action, // "start" | "end" | "update"
+        raw: emb ? JSON.stringify({ title: emb.title || null, desc: emb.description || null })
+                : msg.content || "",
+        guildId: msg.guildId,
+        channelId: msg.channel?.id || null,
+        messageId: msg.id,
+        authorId: msg.author?.id || null,
+        authorTag: msg.author?.tag || msg.author?.username || null
+      };
+      logEvent(evt);
+      return;
+    }
+
+    // REST by Avrae embed result
+    const restProbe = looksLikeAvraeRestEmbed(msg);
+    if (restProbe) {
+      const evt = { ts: Date.now(), source: "avrae-result", type: `rest:${restProbe.subtype}`, subtype: "resolve",
+        raw: JSON.stringify({ title: msg.embeds[0].title, desc: msg.embeds[0].description }),
+        guildId: msg.guildId, channelId: msg.channel?.id || null,
+        messageId: msg.id, authorId: msg.author?.id || null, authorTag: msg.author?.tag || msg.author?.username || null };
+      return logEvent(evt);
+    }
+
+    // else: ignore
+  });
+}
+
+client.on("messageUpdate", async (oldMsg, newMsg) => {
+  try {
+    // Ensure we have full data on edits
+    let msg = newMsg;
+    if (msg?.partial) {
+      msg = await msg.fetch().catch(() => null);
+      if (!msg) return;
+    }
+
+    if (!msg.guildId) return; // ignore DMs
+
+    // Only care about Avrae edits that classify as INIT start/end/update
+    const init = classifyAvraeInit(msg);
+    if (!init) return;
+
+    // We only want to persist/log start/end as high-signal
+    if (init.action !== "start" && init.action !== "end") return;
+
+    // De-dupe per messageId+action (edits can fire multiple times)
+    const dkey = `${msg.id}|${init.action}`;
+    if (processedInitActions.has(dkey)) return;
+    processedInitActions.add(dkey);
+
+    const emb = msg.embeds?.[0];
+    const evt = {
+      ts: Date.now(),
+      source: "avrae-result",
+      type: "combat:init",
+      subtype: init.action, // "start" | "end"
+      raw: emb ? JSON.stringify({ title: emb.title || null, desc: emb.description || null }) : (msg.content || ""),
+      guildId: msg.guildId,
+      channelId: msg.channel?.id || null,
+      messageId: msg.id,
+      authorId: msg.author?.id || null,
+      authorTag: msg.author?.tag || msg.author?.username || null
+    };
+
+    // IMPORTANT: do not use your seenMessageIds guard here—this is an edit of an already-seen message
+    logEvent(evt); // goes through your isHighSignal() and should set wouldWrite:true for end
+  } catch (e) {
+    console.error("messageUpdate(init) failed", e);
+  }
+});
+
+function getActivePartyRosterNames(ctx) {
+  // ctx must have party_id; returns an array like ['Aegis', 'Narathandra Dawnbreak']
+  if (!ctx?.party_id) return [];
+  try {
+    // If your schema uses (party_members) keyed by party_id:
+    const rows = partyDb.prepare(`SELECT character_name FROM party_members WHERE party_id=?`).all(ctx.party_id);
+    return rows.map(r => String(r.character_name || '').trim()).filter(Boolean);
+  } catch (e) {
+    // Fallback if the exact table/column differs — just return empty to keep things working.
+    console.warn('getActivePartyRosterNames failed:', e.message);
+    return [];
+  }
+}
+
+
+// === Event Capture: importance filter (single canonical copy) ===
+const recentHash = new Set();
+function remember(key, ms = 15000) {
+  recentHash.add(key);
+  setTimeout(() => recentHash.delete(key), ms).unref?.();
+}
+
+function isHighSignal(evt) {
+  const [main, variant] = String(evt.type || "").split(":"); // e.g., "combat","init"
+  const chanKey = `${evt.channelId}|${evt.type}|${evt.subtype || ""}`;
+
+  // INIT: only start/end are high-signal; updates are noisy
+  if (main === "combat" && variant === "init") {
+    if (evt.subtype === "start" || evt.subtype === "end") {
+      if (recentHash.has(chanKey)) return false;
+      remember(chanKey, 10000);
+      return true;
+    }
+    return false;
+  }
+
+  // REST resolutions (both short/long) are high-signal
+  if (main === "rest") {
+    if (recentHash.has(chanKey)) return false;
+    remember(chanKey, 8000);
+    return true;
+  }
+
+  // GM-directed declared actions
+  if (evt.type === "decision" && evt.subtype === "declared-action" && evt.directed) {
+    return true;
+  }
+
+  // Everything else is low-signal for now
+  return false;
+}
+
+function logEvent(evt) {
+  const important = isHighSignal(evt);
+
+  // ---- combat transcript taps
+  if (evt.type === 'combat:init' && evt.subtype === 'start') {
+    if (!combatTx.has(evt.channelId)) {        // ⬅️ only start if not already capturing
+      cdbg('EVENT init:start', { chId: evt.channelId });
+      combatCaptureStart(evt.channelId);
+    } else {
+      cdbg('EVENT init:start (ignored; already capturing)', { chId: evt.channelId });
+    }
+  } else if (evt.type === 'combat:init' && evt.subtype === 'end') {
+    cdbg('EVENT init:end', { chId: evt.channelId });
+    writeCombatSummaryFromTranscript(evt);     // async
+  }
+  // ---- end taps
+
+  // Always mirror to console for dev
+  console.log("[event-capture]", JSON.stringify({ ...evt, wouldWrite: important }));
+
+  if (!important) return;
+
+
+  // GATE: only persist during an active session in this channel
+  const ctx = getActiveSessionCtx(evt.guildId, evt.channelId);
+  if (!ctx) return; // no active session → don't write to DB
+
+  const mapping = toGmLogRow(evt); // your mapper that produces {category, content, tags}
+  if (!mapping) return;
+
+  try {
+    writeGmLog({
+      guildId: evt.guildId,
+      channelId: evt.channelId,
+      partyId: ctx.party_id,
+      sessionId: ctx.session_id,
+      category: mapping.category,        // e.g., "event:combat:init"
+      content: mapping.content,          // e.g., "Init started"
+      tags: mapping.tags,                // e.g., "#init/start"
+      adv: ctx.adv_code || null,
+      node: ctx.node_key || null,
+      visibility: "players",
+      created_by: evt.authorId || evt.authorTag || "system"
+    });
+  } catch (e) {
+    console.error("writeGmLog (events) failed", e);
+  }
+}
+
+function normName(s) {
+  return String(s || '')
+    .replace(/<@!?(\d+)>/g, '')       // strip mentions
+    .replace(/[^\w' -]/g, ' ')        // kill punctuation except word/space/quote/hyphen
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Try to spot a proper-looking name (PC-ish) or a monster/token (OG1, GOB2, etc.)
+/*function pickTokenCandidates(text) {
+  const out = new Set();
+
+  // 1) "X attacks ..." or "X casts ..."
+  for (const m of text.matchAll(/\b([A-Za-z][\w' -]{0,24})\s+(?:attacks?|casts?|shoots?|slashes|strikes)\b/g)) {
+    out.add(normName(m[1]));
+  }
+
+  // 2) HP snapshots: "Name <5/20 HP>"
+  for (const m of text.matchAll(/([A-Za-z][\w' -]{0,24})\s*<\s*\d+\s*\/\s*\d+\s*hp\s*>/gi)) {
+    out.add(normName(m[1]));
+  }
+
+  // 3) Initiative banner: "...): Name (..."
+  for (const m of text.matchAll(/initiative\s+\d+\s*\(round\s*\d+\)\*?[:]*\s*([A-Za-z][\w' -]{0,24})/gi)) {
+    out.add(normName(m[1]));
+  }
+
+  // 4) Target/field lead tokens like "OG1 To Hit:" or "Aegis To Hit:"
+  for (const m of text.matchAll(/\b([A-Za-z][\w' -]{0,24}|[A-Z]{2,}\d{0,2})\s+(?:to hit|hits?|miss|damage|takes|suffers|resists|saving|death\s+saving)/gi)) {
+    out.add(normName(m[1]));
+  }
+
+  // Kill empties / single-char noise
+  for (const t of Array.from(out)) {
+    if (!t || t.length < 2) out.delete(t);
+  }
+  return out;
+}*/
+
+// --- Participant extraction (PCs + foes) ---------------------------------
+
+const NAME_STOPWORDS = new Set([
+  'to','melee','bludgeoning','slashing','radiant','necrotic','effect','damage','miss','hit','hits','critical','crit',
+  'initiative','round','current','healthy','injured','resistances','saving','throw','death','save',
+  // common weapon nouns (avoid mis-tagging them as actors)
+  'greatclub','longsword','shortsword','dagger','spear','club','mace','axe','bow','crossbow'
+]);
+
+function isMonsterToken(tok) {
+  return /^[A-Z]{2,}\d{1,3}$/.test(tok); // e.g., OG1, GOB2, WOLF3
+}
+function isPcLikeToken(tok) {
+  // Titlecase or multiword names like "Aegis", "Narathandra Dawnbreak"
+  return /^[A-Z][A-Za-z][\w' -]{0,22}$/.test(tok) && tok.toLowerCase() !== tok;
+}
+function isNameToken(tok) {
+  if (!tok) return false;
+  const t = tok.trim();
+  if (!t || t.length < 2) return false;
+  if (NAME_STOPWORDS.has(t.toLowerCase())) return false;
+  return isMonsterToken(t) || isPcLikeToken(t);
+}
+
+function stripMd(s) {
+  return String(s || '')
+    .replace(/`{1,3}[^`]*`{1,3}/g, '')  // remove inline/codefence
+    .replace(/\*\*?|__|~~|>|\|\|/g, '') // bold/italics/strike/quote/spoiler
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+function linesFromItem(it) {
+  const blob = [
+    it.title || '',
+    it.desc  || '',
+    it.fields|| '',
+    it.content || ''
+  ].join('\n');
+  return blob
+    .split(/\n+/)
+    .map(s => stripMd(s).trim())
+    .filter(Boolean);
+}
+
+function actorFromAttackTitle(title) {
+  const m = /^\s*([A-Za-z][\w' -]{0,24}|[A-Z]{2,}\d{1,3})\s+attacks?\b/i.exec(title || '');
+  return m && isNameToken(m[1]) ? m[1] : null;
+}
+
+function extractNamesFromHP(line) {
+  // "Aegis <5/20 HP>" or "OG1: <Injured>"
+  const out = [];
+  let m = /([A-Za-z][\w' -]{0,24}|[A-Z]{2,}\d{1,3})\s*<\s*\d+\s*\/\s*\d+\s*hp\s*>/i.exec(line);
+  if (m && isNameToken(m[1])) out.push(m[1]);
+  m = /(^|\s)([A-Z]{2,}\d{1,3})\s*:\s*<\w+>/i.exec(line);
+  if (m && isNameToken(m[2])) out.push(m[2]);
+  return out;
+}
+
+function extractTargetByLayout(lines, i) {
+  // A layout Avrae often uses: a line with just "Aegis"
+  // followed by "To Hit:" or "Damage:" → target is "Aegis"
+  const here = lines[i] || '';
+  const next = lines[i+1] || '';
+  if (/^[A-Za-z][\w' -]{0,24}$/.test(here) && /^(to hit|damage|miss|hit)/i.test(next)) {
+    return isNameToken(here) ? here : null;
+  }
+  return null;
+}
+
+function getActivePartyRosterNames(ctx) {
+  if (!ctx?.party_id) return [];
+  try {
+    const rows = partyDb.prepare(`SELECT character_name FROM party_members WHERE party_id=?`).all(ctx.party_id);
+    return rows.map(r => String(r.character_name || '').trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function extractParticipantsFromTranscript(items, roster=[]) {
+  const counts = new Map(); // token -> freq
+  for (const it of items) {
+    const lines = linesFromItem(it);
+
+    // Attack headers → actor
+    const actor = actorFromAttackTitle(it.title || '');
+    if (actor) counts.set(actor, (counts.get(actor) || 0) + 2); // weight actors a bit
+
+    // Layout-based targets & HP snapshots
+    for (let i=0; i<lines.length; i++) {
+      const ln = lines[i];
+
+      // HP snapshots & "OG1: <Injured>"
+      for (const n of extractNamesFromHP(ln)) {
+        counts.set(n, (counts.get(n) || 0) + 1);
+      }
+
+      // Added to combat
+      const add = /\b([A-Z]{2,}\d{1,3})\b\s+was added to combat/i.exec(ln);
+      if (add && isNameToken(add[1])) {
+        counts.set(add[1], (counts.get(add[1]) || 0) + 1);
+      }
+
+      // Target line
+      const tgt = extractTargetByLayout(lines, i);
+      if (tgt) counts.set(tgt, (counts.get(tgt) || 0) + 1);
+    }
+
+    // Field-lead tokens like "OG1 To Hit:" or "Aegis To Hit:"
+    const m = /\b([A-Za-z][\w' -]{0,24}|[A-Z]{2,}\d{1,3})\s+(to hit|hits?|miss|damage|takes|suffers|resists)\b/i.exec(
+      (it.fields || it.desc || it.title || '')
+    );
+    if (m && isNameToken(m[1])) counts.set(m[1], (counts.get(m[1]) || 0) + 1);
+  }
+
+  // Rank and split into PCs/NPCs using roster (case-insensitive exact/contains)
+  const rosterLc = roster.map(r => r.toLowerCase());
+  const ranked = [...counts.entries()]
+    .filter(([name]) => isNameToken(name)) // safety filter against stray tokens
+    .sort((a,b) => b[1]-a[1])
+    .map(([n]) => n);
+
+  const pcs = [];
+  const npcs = [];
+  for (const n of ranked) {
+    const lc = n.toLowerCase();
+    const isPc = rosterLc.some(r => r === lc || lc.includes(r) || r.includes(lc));
+    (isPc ? pcs : npcs).push(n);
+  }
+
+  return { pcs, npcs, all: ranked };
+}
+
+// --- Outcome hints: downed names and likely finisher ---------------------
+
+function extractOutcomeHints(items) {
+  // Find last "<0/HP>" snapshot and who caused it (previous attack actor)
+  let lastDownIdx = -1;
+  let downedName = null;
+
+  const hp0rx = /([A-Za-z][\w' -]{0,24}|[A-Z]{2,}\d{1,3})\s*<\s*0\s*\/\s*\d+\s*hp\s*>/i;
+
+  for (let i=0; i<items.length; i++) {
+    const hay = [items[i].title||'', items[i].desc||'', items[i].fields||''].join(' ');
+    const m = hp0rx.exec(hay);
+    if (m) {
+      lastDownIdx = i;
+      downedName = m[1];
+    }
+  }
+
+  let finisher = null;
+  if (lastDownIdx > 0 && downedName) {
+    for (let j = lastDownIdx - 1; j >= 0; j--) {
+      const it = items[j];
+      const title = it.title || '';
+      const fields = (it.fields || '').toLowerCase();
+      if (fields.includes(downedName.toLowerCase())) {
+        const a = actorFromAttackTitle(title);
+        if (a) { finisher = a; break; }
+      }
+    }
+  }
+
+  return {
+    downed: downedName ? [downedName] : [],
+    finisher
+  };
 }
 
 
@@ -5316,6 +6641,30 @@ client.on('interactionCreate', async (interaction) => {
           await interaction.reply({ content: 'Could not start session (DB error).', flags: EPH });
           return;
         }
+        // === Auto-recap v1: post last session's highlights (if any) ===
+        try {
+          const prevId = getLastFinishedSessionId(guildId, channelId);
+          if (prevId) {
+            const rows = getEventLogsForSession(prevId, 50);
+            if (rows.length) {
+              const lines = formatRecapLines(rows);
+              const desc  = lines.join('\n').slice(0, 1800); // avoid overlong messages
+              await interaction.channel.send({
+                embeds: [{
+                  color: 0x2b6cb0,
+                  title: 'Last session recap',
+                  description: desc
+                }]
+              });
+              // (optional) pin:
+              // const recapMsg = await interaction.channel.send({ content: desc });
+              // await recapMsg.pin().catch(()=>{});
+            }
+          }
+        } catch (e) {
+          console.error('recap-on-start error:', e);
+        }
+        // === /Auto-recap v1 ===
 
         const embed = {
           color: 0x2b6cb0,
@@ -5330,6 +6679,7 @@ client.on('interactionCreate', async (interaction) => {
           ],
           footer: { text: `Started by ${interaction.user.username}` }
         };
+
 
         await interaction.reply({ embeds: [embed] });
         return;
@@ -5355,8 +6705,8 @@ client.on('interactionCreate', async (interaction) => {
         const exportWhere = interaction.options.getString('export') || 'thread';
         const closeAdv    = interaction.options.getBoolean('close_adv') || false;
 
-        // Tiny recap for now (auto-logger will augment later)
-        const recap = [
+        // Base recap (your existing fields)
+        const baseRecap = [
           `**Session:** ${sess.title || ('Session ' + sess.id)}`,
           sess.goals ? `**Goals:** ${sess.goals}` : null,
           summary ? `**Summary:** ${summary}` : null,
@@ -5366,9 +6716,10 @@ client.on('interactionCreate', async (interaction) => {
           nextTime ? `**Next Time:** ${nextTime}` : null,
         ].filter(Boolean).join('\n');
 
+        // End the session (DB)
         partyDb.exec('BEGIN IMMEDIATE');
         try {
-          endSessionById.run(interaction.user.id, recap, sess.id);
+          endSessionById.run(interaction.user.id, baseRecap, sess.id);
           if (closeAdv) {
             partyDb.prepare(`UPDATE parties SET adventure_code=NULL, current_node_key=NULL WHERE id=?`).run(party.id);
           }
@@ -5381,7 +6732,31 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        // Post recap as requested
+        // Build highlights from THIS session's high-signal events
+        const evRows  = getEventLogsForSession(sess.id, 50);           // ← uses ended session id
+        const evLines = evRows.length ? formatRecapLines(evRows) : [];
+        const finalRecap = [
+          baseRecap,
+          evLines.length ? '**Highlights:**' : null,
+          ...evLines
+        ].filter(Boolean).join('\n').slice(0, 1900); // keep under message limit
+
+        // Persist a durable summary row tied to the ENDED session
+        try {
+          insGmLog.run(
+            guildId, channelId, party.id, sess.id,
+            'event:session:summary',
+            finalRecap || 'Session ended.',
+            '#recap',
+            sess.adv_code || null, sess.node_key || null,
+            'players', null, null,
+            interaction.user.id, Date.now()
+          );
+        } catch (e) {
+          console.error('gmlog session:summary write failed', e);
+        }
+
+        // Export recap (thread or file)
         if (exportWhere === 'thread') {
           try {
             const thread = await interaction.channel.threads.create({
@@ -5389,14 +6764,14 @@ client.on('interactionCreate', async (interaction) => {
               autoArchiveDuration: 1440,
               reason: 'Session recap'
             });
-            await thread.send(recap || 'Session ended.');
+            await thread.send(finalRecap || 'Session ended.');
           } catch (e) {
             console.warn('Could not create recap thread:', e.message);
             await interaction.reply({ content: 'Session ended. (Couldn’t create recap thread; check channel perms.)', flags: EPH });
             return;
           }
         } else if (exportWhere === 'file') {
-          const buf = Buffer.from(recap || 'Session ended.', 'utf8');
+          const buf = Buffer.from(finalRecap || 'Session ended.', 'utf8');
           await interaction.channel.send({ files: [{ attachment: buf, name: 'session_recap.txt' }] });
         }
 
@@ -5934,14 +7309,19 @@ client.on('interactionCreate', async (interaction) => {
           const after = getQtyForRow.get(guildId, channelId, partyId, item, unit);
           const newQty = Number(after?.qty) || 0;
           const unitStr = unit ? ` ${unit}` : '';
+          const itemSlug = item.toLowerCase().replace(/\s+/g, '-');
 
-          // Optional: audit trail in gm_logs
           insGmLog.run(
             guildId, channelId, partyId, getActiveSessionIdSafe(guildId, channelId),
-            'stash:add', `+${qty} ${item}${unitStr}${notes ? ` — ${notes}` : ''}`,
-            normTags(`#stash #${item.replace(/\s+/g, '-')}`), null, null,
-            'gm', null, null, interaction.user.id, Date.now()
+            'stash:add',
+            `+${qty}${unitStr} ${item}${notes ? ` — ${notes}` : ''}`,
+            normTags(`#stash #${itemSlug}`),
+            null, null,            // adv_code, node_key (fill if you have them)
+            'gm', null, null,
+            interaction.user.id,
+            Date.now()
           );
+
 
           // Reply — if brand new, don’t show the “now have” total
           if (wasNew) {
@@ -6021,12 +7401,18 @@ client.on('interactionCreate', async (interaction) => {
           );
           stashDeleteRowIfZero.run(guildId, channelId, partyId, item, unit);
 
-          // Optional audit trail in gm_logs
+          // compute a friendly unit string and an item slug once
+          const itemSlug = item.toLowerCase().replace(/\s+/g, '-');
+
           insGmLog.run(
             guildId, channelId, partyId, getActiveSessionIdSafe(guildId, channelId),
-            'stash:remove', `-${toRemove} ${item}${unitStr}`,
-            normTags(`#stash #${item.replace(/\s+/g, '-')}`), null, null,
-            'gm', null, null, interaction.user.id, Date.now()
+            'stash:remove',
+            `-${toRemove}${unitStr} ${item}`,
+            normTags(`#stash #${itemSlug}`),
+            null, null,
+            'gm', null, null,
+            interaction.user.id,
+            Date.now()
           );
 
           if (remaining <= 0) {
@@ -6829,3 +8215,13 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
+client.once('ready', () => {
+  globalThis.BOT_USER_ID = client.user?.id || null;
+});
+
+
+// Call this once after client.login(...)
+attachCombatTranscriptHarvest(client);
+
+// --- /Harvest Avrae combat lines -----------------------------------------
