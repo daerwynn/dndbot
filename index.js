@@ -20,6 +20,9 @@ const INIT_LIST_CMD = process.env.AVRAE_INIT_LIST_CMD || '!init list';
 const rosterPromptAt = new Map(); // chId -> ts
 const ROSTER_PROMPT_COOLDOWN_MS = 30_000;
 
+const COMBAT_CAPTURE_MODE = (process.env.COMBAT_CAPTURE_MODE || 'signal').toLowerCase(); // 'signal' | 'full'
+const MODE_FULL = COMBAT_CAPTURE_MODE === 'full';
+
 // --- Embed safety helpers (avoid empty strings & overlong text) ---
 const EMBED_LIMITS = {
   title: 256,
@@ -2017,14 +2020,15 @@ function upsertCombatLine(msg) {
   if (!st) return;
 
   const emb = msg.embeds?.[0];
-  const fieldsText = joinFields(emb);
   const next = {
     id: msg.id,
     t: msg.createdTimestamp || Date.now(),
-    author: msg.author?.username || msg.author?.tag || 'Avrae',
+    author: msg.author?.username || msg.author?.tag || 'Unknown',
+    authorId: msg.author?.id || null,
+    isBot: !!msg.author?.bot,
     title: emb?.title || null,
     desc: emb?.description || null,
-    fields: fieldsText || null,
+    fields: joinFields(emb) || null,
     content: msg.content || null
   };
 
@@ -2039,8 +2043,8 @@ function upsertCombatLine(msg) {
   } else {
     st.items.push(next);
     st.seen.add(msg.id);
-    const clean = cleanLine(next).slice(0, 120);
-    cdbg('LINE+', { chId, count: st.items.length, preview: clean, hasDesc: !!next.desc, hasFields: !!next.fields });
+    const clean = cleanLine(next).slice(0, 140);
+    cdbg('LINE+', { chId, count: st.items.length, preview: clean, mode: COMBAT_CAPTURE_MODE });
   }
 
   if (st.items.length > COMBAT_SUMMARY_MAX_LINES) {
@@ -2049,15 +2053,18 @@ function upsertCombatLine(msg) {
 }
 
 
-// A tiny cleaner that strips dice math fluff
-function cleanLine({ title, desc, content, fields }) {
-  // Prefer embed title/content for the left side
-  let left = title || content || '';
 
-  // Strip initiative banner prefixes like "**Initiative 12 (round 2)**: Aegis (...)"
+// A tiny cleaner that strips dice math fluff
+function cleanLine({ title, desc, content, fields, author, isBot }) {
+  // For human messages (RP/GM), show "Author: message"
+  if (!isBot && (content || '').trim()) {
+    return `${author}: ${content.trim()}`.slice(0, 300);
+  }
+
+  // For Avrae (or other bots), keep structured view; trim initiative banner noise
+  let left = title || content || '';
   left = left.replace(/^\s*\*{0,2}initiative\s+\d+\s*\(round\s*\d+\)\*{0,2}:\s*/i, '');
 
-  // Merge description + fields; strip backticks/dice notation; squish spaces
   const right = [desc || '', fields || '']
     .join(' ')
     .replace(/`[^`]+`/g, '')
@@ -2231,33 +2238,32 @@ async function writeCombatSummaryFromTranscript(evt) {
 // --- Harvest Avrae combat lines during active combat ---------------------
 function tryHarvestCombatLine(msg) {
   const chId = msg?.channel?.id;
-  if (!chId) return;
-  if (!msg.guildId) return;
+  if (!chId || !msg.guildId) return;
 
-  const relevant = looksCombatRelevant(msg);
-  const active = combatTx.has(chId);
+  const active   = combatTx.has(chId);
+  const relevant = MODE_FULL ? true : looksCombatRelevant(msg);
 
-  // Opportunistic auto-arm when the first clearly relevant Avrae line shows up
-  if (relevant && !active) {
-    cdbg('AUTO-START (harvest)', { chId, reason: 'first relevant Avrae combat line' });
+  // In FULL mode we still need a gate; rely on init:start or opportunistic arm
+  if (!active) {
+    if (!relevant) { cdbg('HARV skip (no active transcript)', { chId }); return; }
+    cdbg('AUTO-START (harvest)', { chId, reason: MODE_FULL ? 'full-mode first line' : 'first relevant Avrae line' });
     combatCaptureStart(chId);
   }
 
-  if (!combatTx.has(chId)) {
-    cdbg('HARV skip (no active transcript)', { chId });
-    return;
+  // In FULL mode, include humans + Avrae; skip this bot’s own messages
+  if (MODE_FULL) {
+    if (msg.author?.id === globalThis.BOT_USER_ID) return; // skip ourselves
+    // (Optionally drop Discord service/system messages if needed)
+  } else {
+    // Signal mode: only keep relevant lines (Avrae attacks, HP, etc.)
+    if (!relevant) {
+      cdbg('HARV drop (irrelevant)', { chId, id: msg.id, preview: (msg.embeds?.[0]?.title || msg.content || '').slice(0, 80) });
+      return;
+    }
   }
 
-  if (relevant) {
-    cdbg('HARV keep candidate', { chId, id: msg.id });
-    upsertCombatLine(msg); // merges edits/fields by messageId
-  } else {
-    cdbg('HARV drop (irrelevant)', {
-      chId,
-      id: msg.id,
-      preview: (msg.embeds?.[0]?.title || msg.content || '').slice(0, 80)
-    });
-  }
+  cdbg('HARV keep candidate', { chId, id: msg.id, mode: COMBAT_CAPTURE_MODE });
+  upsertCombatLine(msg); // merges edits/fields
 }
 
 
@@ -8209,6 +8215,11 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+
+client.once('ready', () => {
+  globalThis.BOT_USER_ID = client.user?.id || null;
+});
+
 
 // Call this once after client.login(...)
 attachCombatTranscriptHarvest(client);
