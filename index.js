@@ -2053,7 +2053,6 @@ function upsertCombatLine(msg) {
 }
 
 
-
 // A tiny cleaner that strips dice math fluff
 function cleanLine({ title, desc, content, fields, author, isBot }) {
   // For human messages (RP/GM), show "Author: message"

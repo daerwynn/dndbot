@@ -244,3 +244,12 @@
 - Keep this ADR log in source (canvas/docs) and update when decisions change.  
 - Reference ADR numbers in commit messages for related changes.
 
+
+## Decision: High-signal persistence, transcript for narration
+We do **not** persist every roll/event. Rationale:
+• DB size & noise control; replays come from Avrae + summaries.
+• We keep a per-combat transcript in memory (signal or full mode) and flush one summary to `gm_logs`.
+• GPT summarizes from a cleaned transcript; if GPT is off or fails, heuristic summary is stored.
+• Participants/outcome hints reduce hallucinations; Avrae is the dice authority.
+Trade-offs considered: full persistence (rejected for size/noise), GPT-only (rejected for reliability).
+

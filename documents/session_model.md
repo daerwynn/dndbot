@@ -136,6 +136,12 @@ While a session is active, the bot should observe:
    - When a node is opened/continued, insert `gm_logs` rows with `category = 'adv:node'`, plus `related_adv_code` & `related_node_key`.
 2. **Encounters & combat**
    - Detect initiative/attack/skill roll patterns from Avrae posts; log summaries (e.g., `category = 'combat'`, `content = 'Orc ambush resolved; party won'`).
+  • On **init start/end** (Avrae): write `event:combat:init` (start/end).
+  • On **init end**: flush combat transcript → write `event:combat:summary`.
+  • On **rest** (Avrae result): write `event:rest:short|long`.
+  • On **directed action** (@bot or /gm …): write `event:decision`.
+  • On **/session end**: write `event:session:summary` and post recap.
+  All of the above are gated by an active session.
 3. **Decisions & consequences**
    - When a choice button is pressed or a decision is confirmed in chat, log as `category = 'decision'` with tags like `#npc:Strahd` or `#location:OldBridge`.
 4. **Loot & stash updates**

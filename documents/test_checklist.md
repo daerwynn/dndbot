@@ -114,6 +114,15 @@ A pragmatic, end‑to‑end checklist for validating the **D&D GM Bot** in a rea
 - [ ] During an active session, `/adv open …` allowed; without active session it warns/gates.
 - [ ] `/session end` closes session; `/session status` shows none active.
 - [ ] Restart session and verify continued logging/reputation/stash belong to new `session_id`.
+  ### Event Capture & Combat Summary (new)
+  1. Start session → `!init begin` → see `event:combat:init (start)` in /gmlog show.
+  2. Exchange attacks; ensure transcript captures embed fields (to-hit, damage, HP).
+  3. End combat → `event:combat:summary` row appears; contents mention participants; no hallucinated names.
+  4. Rests: trigger Avrae short/long rest result → `event:rest:*` row written.
+  5. Directed action: mention @Bot with an action → `event:decision` row written.
+  6. End session → recap thread posted and `event:session:summary` row exists.
+  7. (Full mode) Set `COMBAT_CAPTURE_MODE=full` → RP/GM lines appear in transcript → summary reflects RP beats.
+
 
 ---
 
