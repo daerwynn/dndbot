@@ -48,6 +48,20 @@ This document explains the Game Master logging system used by the bot: data mode
 - Integrations: `rep:add`, `rep:set`, `rep:note`, `stash:add`, `stash:remove`, `note:add`, `note:edit`, `note:pin`, `note:unpin`
 - Adventure links: `adv:start`, `adv:node`, `adv:end`
 
+## Event Categories (added)
+| category                | content example                           | tags                    |
+|-------------------------|-------------------------------------------|-------------------------|
+| event:combat:init       | "Initiative started" / "Initiative ended" | #init/start or #init/end|
+| event:combat:summary    | "A 3-minute skirmish — 5 hits, 1 miss…"   | #combat/summary         |
+| event:rest:short        | "Short rest resolved"                     | #rest/short             |
+| event:rest:long         | "Long rest resolved"                      | #rest/long              |
+| event:decision          | "I sneak past the guard"                  | #decision               |
+| event:session:summary   | recap text at /session end                | #recap                  |
+
+Notes:
+• These rows only write while a session is active.
+• `events search <text>` continues to match `category`, `content`, and `tags`.
+
 > Use tags for quick faceting: `#npc:<name>`, `#faction:<name>`, `#location:<name>`, `#loot`, `#mystery`, etc.
 
 ---

@@ -86,10 +86,13 @@ Explicit table time control; `/adv` requires an active session.
 
 ### start
 Begin a new session for the active party, capturing timestamp and optional summary.
+Starts a session. Also posts a “previous session recap” (from pinned note/logs) if available.
 - **note** (string, optional) – opening remark/agenda
 
 ### end
 End the current session for the active party.
+Ends the session. Writes a recap summary to `gm_logs` (`event:session:summary`) and posts a recap
+(thread by default; `export:file` available). Optional: close adventure.
 - **note** (string, optional) – closing recap
 
 ### status
@@ -179,6 +182,12 @@ Freeform log line.
 - **visibility** (string, optional; default `gm`)
 
 ### show (generic log)
+ Shows recent GM log entries. New categories may appear:
+  • `event:combat:init`   (Init started/ended; tags: `#init/start|#init/end`)
+  • `event:combat:summary`(One-paragraph recap; tag: `#combat/summary`)
+  • `event:rest:short|long` (tags `#rest/short|#rest/long`)
+  • `event:decision`      (GM-directed action)
+  • `event:session:summary` (session end recap; tag `#recap`)
 - **limit** (integer, optional; default 10)
 
 ### search (generic; logs + notes)

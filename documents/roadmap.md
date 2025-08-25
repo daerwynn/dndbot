@@ -49,6 +49,10 @@
 
 ### Phase 1 — Event Sensing & Intent Understanding
 - **Detectors**: parsers for Avrae messages: ability/skill checks, attacks/damage/crit, saves, initiative blocks, rests, death saves, heal.
+✅ Event detectors (init, rests, directed actions) and combat transcript (signal/full)
+✅ Combat summary (heuristic + GPT with participants/outcome hints)
+NEXT: scene_state JSON, context-pack builder, cautious Auto-GM “speak v1”, choice UI helper.
+
 - **Generic roll inference**: map `!roll`/freeform to likely context (Stealth, Perception, etc.).
 - **Intent classifier**: IC talk vs. OOC vs. table question vs. declared action; GM‑directed mentions.
 - **Choice hooks**: durable button/select handlers tied to current node.

@@ -98,3 +98,25 @@ Typical lookups: by active party, by `(guild, channel, party_id, character_name)
 3) **Reputation** and **stash** mutate via commands and/or automated heuristics (social/combat/loot), with changes mirrored to `gm_logs`.
 4) **Recaps** and **resumes** draw from `gm_logs` + `party_notes` + `party_sessions` to rehydrate context.
 
+## 9) Event Capture & Combat Transcript (v1)
+Source of truth for rolls/outcomes is **Avrae**. We listen on `messageCreate` and `messageUpdate` and
+push events into the bot:
+• Classifiers: init start/end (Avrae), checks, rests, GM-directed actions.
+• Combat transcript: armed on init:start (or first relevant Avrae embed), flushed on init:end.
+• Two modes (env): `COMBAT_CAPTURE_MODE=signal|full`
+  - signal: only relevant Avrae embeds (attacks, to-hit, damage, HP, banners).
+  - full: ALL messages between init begin/end (RP/GM + Avrae; excludes this bot).
+• Summarization:
+  - Heuristic fallback (hits/misses/crits/heals/downed + lowest HP).
+  - GPT (if `COMBAT_SUMMARY_GPT=1`) with participants + 0-HP finisher hints.
+• Persistence:
+  - `gm_logs`: `event:combat:init` (start/end), `event:combat:summary`,
+    `event:rest:short|long`, `event:decision`, `event:session:summary`.
+
+### Configuration
+Env flags:
+  - `AVRAE_BOT_ID` (optional strict match)
+  - `COMBAT_CAPTURE_MODE=signal|full`
+  - `COMBAT_SUMMARY_GPT=0|1`
+  - `COMBAT_SUMMARY_MODEL` (optional, e.g. gpt-4o-mini)
+  - `DEBUG_COMBAT=0|1`
